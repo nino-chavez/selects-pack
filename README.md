@@ -131,6 +131,31 @@ For every row of `<workdir>/shot-cards.csv`, one pre-trimmed clip. Plus identity
 - A row with an empty in or out stops the run and names the rows. A range outside the clip,
   or an alternate it cannot read, stops it too and names the clip.
 
+### draft (spike)
+
+    selects-pack draft <pack> --template <capcut-project> --stage DIR [--name NAME] [--identity STEM]... [--overlay-seconds N]
+
+Stages a new CapCut project from a selects pack, in a scratch folder. It never writes to the
+template project or to CapCut's drafts folder; installing the staged project is a separate,
+manual step.
+
+- The main track holds every select in `ORDER.txt` order, back to back, at source length.
+- Each `--identity` overlay gets its own track and is laid at the end, never before 60% of
+  the footage. The default is event, club and wordmark; name a day label only when it is
+  true of the footage.
+- File shapes come from an existing project used read-only as `--template`. Every id is
+  regenerated, and the run fails if any template id leaks into the new files.
+- Writes `draft_info.json` at the root and under `Timelines/<id>/`, plus
+  `draft_meta_info.json`, `Timelines/project.json`, `timeline_layout.json` and
+  `draft_settings`.
+
+Spike result, 2026-10-18, CapCut 8.9.1 on TPS batch-3: the staged project read back through
+`edl` with 30 selects in pack order, no gaps, and the first overlay at 89% of 112.042 s. It
+was installed by copying the folder in and adding one entry to `root_meta_info.json`, after
+a timestamped backup. CapCut listed it with the right duration. Opening it was not verified:
+the agent's click was refused by its permission classifier, so a person has to open it once.
+Until that check passes, this command stays a spike and off main.
+
 ## shot-cards.csv
 
 The `clip-selects.csv` shape plus one column:

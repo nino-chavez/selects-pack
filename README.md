@@ -180,9 +180,9 @@ manual step.
 Spike result, 2026-10-18, CapCut 8.9.1 on TPS batch-3: the staged project read back through
 `edl` with 30 selects in pack order, no gaps, and the first overlay at 89% of 112.042 s. It
 was installed by copying the folder in and adding one entry to `root_meta_info.json`, after
-a timestamped backup. CapCut listed it with the right duration. Opening it was not verified:
-the agent's click was refused by its permission classifier, so a person has to open it once.
-Until that check passes, this command stays a spike and off main.
+a timestamped backup. CapCut listed it with the right duration. The agent's click to open it
+was refused by its permission classifier; Nino opened it by hand on 2026-10-18 and confirmed
+the clips were on the timeline.
 
 ## shot-cards.csv
 
@@ -233,6 +233,7 @@ file landed with a hash suffix. No real card was mounted during the dry run.
 
 - `ingest` knows Sony and DJI card layouts. Another camera lands in `card-support/` intact.
 - Moment-finding is not automated. The sheets make it cheap; they do not do it.
-- `draft` stages a CapCut project but does not install it, and opening one in CapCut 8.9.1
-  has not been verified (see the draft section).
+- `draft` stages a CapCut project but does not install it. Installing means copying the
+  folder into CapCut's drafts folder and adding one `root_meta_info.json` entry, after a backup.
+  Verified on CapCut 8.9.1 only.
 - One machine at a time: there is no lock on the work folder.

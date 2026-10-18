@@ -233,5 +233,6 @@ file landed with a hash suffix. No real card was mounted during the dry run.
 
 - `ingest` knows Sony and DJI card layouts. Another camera lands in `card-support/` intact.
 - Moment-finding is not automated. The sheets make it cheap; they do not do it.
-- CapCut imports the folder; the tool writes no CapCut draft (that is slice 4 of the proposal).
+- `draft` stages a CapCut project but does not install it, and opening one in CapCut 8.9.1
+  has not been verified (see the draft section).
 - One machine at a time: there is no lock on the work folder.

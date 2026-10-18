@@ -159,6 +159,30 @@ tracks, 53.866666 s. The EDL matches 630-marketing-automation's
 `capcut-project-summary.json` on every field except the ignored `limits`. Two planted
 wrong values in a copy of the reference were both named, and a planted wrong hash was
 refused.
+### draft (spike)
+
+    selects-pack draft <pack> --template <capcut-project> --stage DIR [--name NAME] [--identity STEM]... [--overlay-seconds N]
+
+Stages a new CapCut project from a selects pack, in a scratch folder. It never writes to the
+template project or to CapCut's drafts folder; installing the staged project is a separate,
+manual step.
+
+- The main track holds every select in `ORDER.txt` order, back to back, at source length.
+- Each `--identity` overlay gets its own track and is laid at the end, never before 60% of
+  the footage. The default is event, club and wordmark; name a day label only when it is
+  true of the footage.
+- File shapes come from an existing project used read-only as `--template`. Every id is
+  regenerated, and the run fails if any template id leaks into the new files.
+- Writes `draft_info.json` at the root and under `Timelines/<id>/`, plus
+  `draft_meta_info.json`, `Timelines/project.json`, `timeline_layout.json` and
+  `draft_settings`.
+
+Spike result, 2026-10-18, CapCut 8.9.1 on TPS batch-3: the staged project read back through
+`edl` with 30 selects in pack order, no gaps, and the first overlay at 89% of 112.042 s. It
+was installed by copying the folder in and adding one entry to `root_meta_info.json`, after
+a timestamped backup. CapCut listed it with the right duration. The agent's click to open it
+was refused by its permission classifier; Nino opened it by hand on 2026-10-18 and confirmed
+the clips were on the timeline.
 
 ## shot-cards.csv
 
@@ -209,5 +233,7 @@ file landed with a hash suffix. No real card was mounted during the dry run.
 
 - `ingest` knows Sony and DJI card layouts. Another camera lands in `card-support/` intact.
 - Moment-finding is not automated. The sheets make it cheap; they do not do it.
-- CapCut imports the folder; the tool writes no CapCut draft (that is slice 4 of the proposal).
+- `draft` stages a CapCut project but does not install it. Installing means copying the
+  folder into CapCut's drafts folder and adding one `root_meta_info.json` entry, after a backup.
+  Verified on CapCut 8.9.1 only.
 - One machine at a time: there is no lock on the work folder.

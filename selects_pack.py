@@ -8,6 +8,7 @@ Subcommands, the first four lifted from the TPS opening-weekend campaign scripts
   detail  a finer contact sheet for one time range of one clip (the moment-finding aid)
   pack    one pre-trimmed clip per shot-card row, identity overlays, originals.txt, ORDER.txt
   edl     read a CapCut draft (an accepted cut) into an edit decision list JSON
+  draft   (spike) stage a new CapCut project from a selects pack
 
 The cut stays with the editor. This tool ends at a folder that can be dragged into CapCut.
 """
@@ -843,6 +844,185 @@ def cmd_edl(a) -> int:
         print(f'matches {a.compare} on every compared field (ignored: {", ".join(sorted(ignore)) or "none"})')
     return 0
 
+# ---------------------------------------------------------------- draft (spike)
+
+import copy
+import uuid
+
+CAPCUT_DRAFTS = Path.home() / 'Movies/CapCut/User Data/Projects/com.lveditor.draft'
+SEGMENT_REF_TYPES = ['speeds', 'placeholder_infos', 'canvases', 'material_animations',
+                     'sound_channel_mappings', 'material_colors', 'loudnesses', 'vocal_separations']
+DEFAULT_DRAFT_IDENTITY = ['the-point-series-light', '630-volleyball-light', '630-wordmark-red-white-official-6000']
+
+
+def new_id() -> str:
+    return str(uuid.uuid4()).upper()
+
+
+def build_draft(pack_dir: Path, template: Path, name: str, root: Path, overlay_seconds: float, identity: list[str]) -> tuple[dict, dict, dict]:
+    """A new CapCut draft from a selects pack, shaped after an existing project used read-only as a
+    template: selects in ORDER on the main track, identity PNGs on their own tracks after 60%."""
+    pack = json.loads((pack_dir / 'pack.json').read_text())
+    tpl = json.loads((template / 'draft_info.json').read_text())
+    tpl_meta = json.loads((template / 'draft_meta_info.json').read_text())
+    by_type = {}
+    for k, v in tpl['materials'].items():
+        if isinstance(v, list) and v:
+            by_type[k] = v[0]
+    seg_by_kind, mat_by_kind, track_by_kind = {}, {}, {}
+    vids = {m['id']: m for m in tpl['materials']['videos']}
+    for t in tpl['tracks']:
+        if t['type'] != 'video':
+            continue
+        for sg in t['segments']:
+            kind = vids[sg['material_id']]['type']
+            seg_by_kind.setdefault(kind, sg)
+            mat_by_kind.setdefault(kind, vids[sg['material_id']])
+            track_by_kind.setdefault(kind, {k: v for k, v in t.items() if k != 'segments'})
+    lacking = [k for k in ('video', 'photo') if k not in seg_by_kind]
+    if lacking:
+        raise SystemExit(f'template {template} has no {" or ".join(lacking)} segment on a video track to copy '
+                         'the shape from; use a project with footage and an imported PNG')
+    if not pack.get('selects'):
+        raise SystemExit('pack.json lists no selects')
+    d = copy.deepcopy(tpl)
+    timeline_id = new_id()
+    d['id'] = timeline_id
+    d['materials'] = {k: ([] if isinstance(v, list) else v) for k, v in tpl['materials'].items()}
+    d['tracks'] = []
+    d['keyframes'] = {k: [] for k in tpl['keyframes']}
+    d['relationships'] = []
+    d['time_marks'] = None if tpl.get('time_marks') is None else tpl['time_marks'].__class__()
+    now_us = int(time.time() * US)
+    d['create_time'] = d['update_time'] = now_us // US
+
+    def add_segment(track, kind, path, src_us, start_us, dur_us, w, h, has_audio, render_index, transform_y=0.0):
+        mat = copy.deepcopy(mat_by_kind[kind])
+        mat.update(id=new_id(), path=str(path), media_path='', local_material_id='', material_name=Path(path).name,
+                   width=w, height=h, has_audio=has_audio, unique_id='', origin_material_id='', request_id='')
+        if kind == 'video':
+            mat['duration'] = src_us
+        d['materials']['videos'].append(mat)
+        refs = []
+        for rt in SEGMENT_REF_TYPES:
+            if rt == 'loudnesses' and kind != 'video':
+                continue
+            if rt not in by_type:
+                continue
+            ref = copy.deepcopy(by_type[rt])
+            ref['id'] = new_id()
+            if rt == 'material_animations':
+                ref['animations'] = []
+            if rt == 'speeds':
+                ref['speed'] = 1.0
+            d['materials'][rt].append(ref)
+            refs.append(ref['id'])
+        seg = copy.deepcopy(seg_by_kind[kind])
+        seg.update(id=new_id(), material_id=mat['id'], extra_material_refs=refs, speed=1.0,
+                   source_timerange={'start': 0, 'duration': dur_us},
+                   target_timerange={'start': start_us, 'duration': dur_us},
+                   render_index=render_index, track_render_index=render_index, keyframe_refs=[],
+                   common_keyframes=[], raw_segment_id='', group_id='', template_id='')
+        seg['clip'] = {'scale': {'x': 1.0, 'y': 1.0}, 'rotation': 0.0, 'transform': {'x': 0.0, 'y': transform_y},
+                       'flip': {'vertical': False, 'horizontal': False}, 'alpha': 1.0}
+        track['segments'].append(seg)
+        return mat
+
+    main = dict(copy.deepcopy(track_by_kind['video']), id=new_id(), segments=[])
+    d['tracks'].append(main)
+    cursor = 0
+    meta_materials = []
+    for r in pack['selects']:
+        dur_us = int(round(r['duration_seconds'] * US))
+        path = (pack_dir / r['file']).resolve()
+        add_segment(main, 'video', path, dur_us, cursor, dur_us, r['width'], r['height'], True, 0)
+        meta_materials.append((path, dur_us, r['width'], r['height'], 'video'))
+        cursor += dur_us
+    footage_us = cursor
+    overlays = {Path(o['file']).stem: (pack_dir / o['file']).resolve() for o in pack.get('overlays', [])}
+    missing = [k for k in identity if k not in overlays]
+    if missing:
+        raise SystemExit(f'pack has no overlay named {missing}; pack holds {sorted(overlays)}')
+    chosen = [overlays[k] for k in identity]
+    # Identity after the action: no overlay before 60% of the footage; they stack at the end, one per track.
+    # The window is the end of the footage, never earlier than 60%; overlays share it evenly when
+    # their requested length does not fit, so none can start past the end or run backwards.
+    each_us = int(overlay_seconds * US)
+    start = max(int(footage_us * 0.6), footage_us - each_us * len(chosen))
+    if chosen:
+        each_us = min(each_us, (footage_us - start) // len(chosen))
+    placed = []
+    for n, path in enumerate(chosen):
+        from PIL import Image
+        with Image.open(path) as im:
+            w, h = im.size
+        t = dict(copy.deepcopy(track_by_kind.get('photo', track_by_kind['video'])), id=new_id(), segments=[])
+        d['tracks'].append(t)
+        s_us = start + n * each_us
+        dur = each_us if n < len(chosen) - 1 else footage_us - s_us
+        if dur <= 0:
+            raise SystemExit(f'no room for overlay {path.name}; footage is {footage_us / US} s')
+        y = 0.0 if 'wordmark' in path.name else -0.78
+        add_segment(t, 'photo', path, 10_800_000_000, s_us, dur, w, h, False, n + 1, transform_y=y)
+        meta_materials.append((path, 5_000_000, w, h, 'photo'))
+        placed.append({'file': path.name, 'start_s': s_us / US, 'duration_s': dur / US})
+    d['duration'] = footage_us
+    fold = root / name
+    tpl_entry = tpl_meta['draft_materials'][0]['value'][0]
+    entries = []
+    for path, dur, w, h, mt in meta_materials:
+        e = copy.deepcopy(tpl_entry)
+        e.update(id=str(uuid.uuid4()), file_Path=str(path), extra_info=path.name, duration=dur, width=w, height=h,
+                 metetype=mt, roughcut_time_range={'duration': dur, 'start': 0}, create_time=0, import_time=0,
+                 import_time_ms=0, md5='')
+        entries.append(e)
+    meta = copy.deepcopy(tpl_meta)
+    draft_id = new_id()
+    meta.update(draft_id=draft_id, draft_name=name, draft_fold_path=str(fold), draft_root_path=str(root),
+                draft_cover='', tm_draft_create=now_us, tm_draft_modified=now_us, tm_duration=footage_us,
+                draft_timeline_materials_size_=0, draft_segment_extra_info=[], draft_materials_copied_info=[])
+    for g in meta['draft_materials']:
+        g['value'] = entries if g['type'] == 0 else []
+    info = {'timeline_id': timeline_id, 'draft_id': draft_id, 'footage_s': footage_us / US,
+            'selects': len(pack['selects']), 'overlays': placed}
+    return d, meta, info
+
+
+def cmd_draft(a) -> int:
+    pack_dir = Path(a.pack).expanduser().resolve()
+    template = Path(a.template).expanduser()
+    root = Path(a.root).expanduser()
+    stage = Path(a.stage).expanduser()
+    name = a.name or f'selects-{time.strftime("%Y%m%d-%H%M%S")}'
+    d, meta, info = build_draft(pack_dir, template, name, root, a.overlay_seconds, a.identity or DEFAULT_DRAFT_IDENTITY)
+    fold = stage / name
+    if fold.exists() or (root / name).exists():
+        print(f'{name} already exists; pick another --name', file=sys.stderr)
+        return 2
+    tl = fold / 'Timelines' / info['timeline_id']
+    tl.mkdir(parents=True)
+    for target in (fold / 'draft_info.json', tl / 'draft_info.json'):
+        write_json(target, d)
+    write_json(fold / 'draft_meta_info.json', meta)
+    now = int(time.time() * US)
+    write_json(fold / 'Timelines' / 'project.json', {
+        'config': {'color_space': -1, 'render_index_track_mode_on': False, 'use_float_render': False},
+        'create_time': now, 'id': new_id(), 'main_timeline_id': info['timeline_id'],
+        'timelines': [{'create_time': now, 'id': info['timeline_id'], 'is_marked_delete': False,
+                       'name': 'Timeline 01', 'update_time': now}], 'update_time': now, 'version': 0})
+    write_json(fold / 'timeline_layout.json', {'dockItems': [{'dockIndex': 0, 'ratio': 1, 'timelineIds': [info['timeline_id']],
+                                                               'timelineNames': ['Timeline 01']}], 'layoutOrientation': 1})
+    (fold / 'draft_settings').write_text(f'[General]\ncloud_last_modify_platform=mac\ndraft_create_time={now // US}\n'
+                                         f'draft_last_edit_time={now // US}\nreal_edit_keys=0\nreal_edit_seconds=0\n')
+    blob = json.dumps(d) + json.dumps(meta)
+    tpl_ids = {i.lower() for i in re.findall(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
+                                             (template / 'draft_info.json').read_text()
+                                             + (template / 'draft_meta_info.json').read_text(), re.I)}
+    blob = blob.lower()
+    leaked = sorted(i for i in tpl_ids if i in blob)
+    write_json(fold / 'selects-pack-draft.json', {**info, 'template': str(template), 'leaked_template_ids': leaked})
+    print(json.dumps({**info, 'staged': str(fold), 'leaked_template_ids': len(leaked)}, indent=2))
+    return 0 if not leaked else 1
 
 # ---------------------------------------------------------------- cli
 
@@ -898,6 +1078,17 @@ def main(argv=None) -> int:
     p.add_argument('--compare', help='reference EDL/summary JSON; exit 1 on any difference')
     p.add_argument('--ignore', action='append', help='top-level reference key to leave out of --compare, repeatable')
     p.set_defaults(fn=cmd_edl)
+    p = sub.add_parser('draft', help='(spike) stage a new CapCut project from a selects pack')
+    p.add_argument('pack', help='selects pack folder holding pack.json')
+    p.add_argument('--template', required=True, help='an existing CapCut project folder, read only, for file shapes')
+    p.add_argument('--stage', required=True, help='folder to build the project in before installing it')
+    p.add_argument('--root', default=str(CAPCUT_DRAFTS), help='CapCut drafts folder the paths will point at')
+    p.add_argument('--name', help='project name (default selects-<timestamp>)')
+    p.add_argument('--overlay-seconds', type=float, default=3.0)
+    p.add_argument('--identity', action='append',
+                   help='overlay stem to lay, in order, repeatable; a day label only when it is true of the footage '
+                        '(default: the-point-series-light, 630-volleyball-light, the wordmark)')
+    p.set_defaults(fn=cmd_draft)
 
     a = ap.parse_args(argv)
     if a.cmd == 'pack' and a.identity is None:

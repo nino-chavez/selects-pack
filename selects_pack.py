@@ -728,6 +728,12 @@ def build_draft(pack_dir: Path, template: Path, name: str, root: Path, overlay_s
             seg_by_kind.setdefault(kind, sg)
             mat_by_kind.setdefault(kind, vids[sg['material_id']])
             track_by_kind.setdefault(kind, {k: v for k, v in t.items() if k != 'segments'})
+    lacking = [k for k in ('video', 'photo') if k not in seg_by_kind]
+    if lacking:
+        raise SystemExit(f'template {template} has no {" or ".join(lacking)} segment on a video track to copy '
+                         'the shape from; use a project with footage and an imported PNG')
+    if not pack.get('selects'):
+        raise SystemExit('pack.json lists no selects')
     d = copy.deepcopy(tpl)
     timeline_id = new_id()
     d['id'] = timeline_id
@@ -788,8 +794,12 @@ def build_draft(pack_dir: Path, template: Path, name: str, root: Path, overlay_s
         raise SystemExit(f'pack has no overlay named {missing}; pack holds {sorted(overlays)}')
     chosen = [overlays[k] for k in identity]
     # Identity after the action: no overlay before 60% of the footage; they stack at the end, one per track.
+    # The window is the end of the footage, never earlier than 60%; overlays share it evenly when
+    # their requested length does not fit, so none can start past the end or run backwards.
     each_us = int(overlay_seconds * US)
     start = max(int(footage_us * 0.6), footage_us - each_us * len(chosen))
+    if chosen:
+        each_us = min(each_us, (footage_us - start) // len(chosen))
     placed = []
     for n, path in enumerate(chosen):
         from PIL import Image
@@ -798,7 +808,9 @@ def build_draft(pack_dir: Path, template: Path, name: str, root: Path, overlay_s
         t = dict(copy.deepcopy(track_by_kind.get('photo', track_by_kind['video'])), id=new_id(), segments=[])
         d['tracks'].append(t)
         s_us = start + n * each_us
-        dur = min(each_us, footage_us - s_us) if n < len(chosen) - 1 else footage_us - s_us
+        dur = each_us if n < len(chosen) - 1 else footage_us - s_us
+        if dur <= 0:
+            raise SystemExit(f'no room for overlay {path.name}; footage is {footage_us / US} s')
         y = 0.0 if 'wordmark' in path.name else -0.78
         add_segment(t, 'photo', path, 10_800_000_000, s_us, dur, w, h, False, n + 1, transform_y=y)
         meta_materials.append((path, 5_000_000, w, h, 'photo'))
@@ -852,8 +864,10 @@ def cmd_draft(a) -> int:
     (fold / 'draft_settings').write_text(f'[General]\ncloud_last_modify_platform=mac\ndraft_create_time={now // US}\n'
                                          f'draft_last_edit_time={now // US}\nreal_edit_keys=0\nreal_edit_seconds=0\n')
     blob = json.dumps(d) + json.dumps(meta)
-    tpl_ids = set(re.findall(r'[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}',
-                             (template / 'draft_info.json').read_text() + (template / 'draft_meta_info.json').read_text()))
+    tpl_ids = {i.lower() for i in re.findall(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
+                                             (template / 'draft_info.json').read_text()
+                                             + (template / 'draft_meta_info.json').read_text(), re.I)}
+    blob = blob.lower()
     leaked = sorted(i for i in tpl_ids if i in blob)
     write_json(fold / 'selects-pack-draft.json', {**info, 'template': str(template), 'leaked_template_ids': leaked})
     print(json.dumps({**info, 'staged': str(fold), 'leaked_template_ids': len(leaked)}, indent=2))

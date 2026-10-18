@@ -752,16 +752,8 @@ def diff_values(ref, got, path='') -> list[str]:
 REASON_FIELDS = ['track_index', 'start_s', 'source', 'source_start_s', 'verdict', 'reason']
 
 
-def apply_reasons(edl: dict, reasons: Path) -> int:
-    """Merge reasons onto clips. A row with track_index and start_s names one segment of the cut.
-    A row without them (a rejected take, a reference that is not in the cut) is kept whole under
-    rejected_references, so no row is dropped."""
-    with reasons.open(newline='') as f:
-        reader = csv.DictReader(f)
-        missing = [c for c in ('track_index', 'start_s', 'verdict') if c not in (reader.fieldnames or [])]
-        if missing:
-            raise SystemExit(f'{reasons} lacks columns {missing}; columns are {", ".join(REASON_FIELDS)}')
-        rows = list(reader)
+def segment_keys(edl: dict) -> dict:
+    """(track_index, start_s) -> clip, refusing a cut where two segments share a key."""
     clips = {}
     for t in edl['video_tracks']:
         for c in t['clips']:
@@ -769,6 +761,20 @@ def apply_reasons(edl: dict, reasons: Path) -> int:
             if key in clips:
                 raise SystemExit(f'two segments start at {key[1]} s on track {key[0]}; reasons cannot tell them apart')
             clips[key] = c
+    return clips
+
+
+def apply_reasons(edl: dict, reasons: Path) -> int:
+    """Merge reasons onto clips. A row with track_index and start_s names one segment of the cut.
+    A row without them (a rejected take, a reference that is not in the cut) is kept whole under
+    rejected_references, so no row is dropped."""
+    with reasons.open(newline='', encoding='utf-8-sig') as f:  # Excel's CSV UTF-8 adds a byte-order mark
+        reader = csv.DictReader(f, restval='')
+        missing = [c for c in ('track_index', 'start_s', 'verdict') if c not in (reader.fieldnames or [])]
+        if missing:
+            raise SystemExit(f'{reasons} lacks columns {missing}; columns are {", ".join(REASON_FIELDS)}')
+        rows = [{k: (v or '').strip() for k, v in r.items() if k is not None} for r in reader]
+    clips = segment_keys(edl)
     seen, hit, unplaced = set(), 0, []
     for r in rows:
         if r.get('track_index', '') == '' or r.get('start_s', '') == '':
@@ -801,6 +807,7 @@ def cmd_edl(a) -> int:
         if tpl.exists():
             print(f'{tpl} already exists; the template never overwrites a reasons file', file=sys.stderr)
             return 2
+        segment_keys(edl)  # refuse before anyone fills in a template that could never be applied
     if a.reasons:
         n = apply_reasons(edl, Path(a.reasons).expanduser())
         print(f'reasons placed on {n} clips; {len(edl["rejected_references"])} rejected or unplaced references kept')

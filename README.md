@@ -54,7 +54,9 @@ Copy-only ingest of mounted cards into the existing SSD layout, lifted from the 
   different bytes is never overwritten: the new file lands as `<name>__<sha12>.<ext>` and the
   row is flagged `filename_collision`.
 - Earlier manifests under `<dest>/review/*/batch-*/` supply `previous_sha256` and keep
-  camera-support files at the destination they already have.
+  camera-support files at the destination they already have. A prior row matches on path,
+  size and mtime together, because a reformatted Sony card mounts at the same path and
+  restarts clip numbering.
 - Needs free space for the new files plus 1 GiB, or it stops before copying.
 - The manifest is the batch-3 shape plus `source_id` (the destination stem) and
   `card_profiles`. It is rewritten after every file, so a stopped run can be rerun.
@@ -76,9 +78,13 @@ and one row in `<out>/shot-cards.csv`.
 - `--sheet-fps`: frames per second on the sheet, default 1. Clips over 40 s are sampled
   more sparsely so a sheet stays near 40 tiles.
 - `--workers`: parallel clips, default 3.
-- `--force`: rebuild proxies, sheets and the shot cards. Without it, a clip whose sha256 and
-  index version match its `clip.json` is reused, and an existing `shot-cards.csv` is kept
-  unless `--selects` is given.
+- `--force`: rebuild proxies and sheets. A clip whose sha256 and index version match its
+  `clip.json` is otherwise reused.
+- `shot-cards.csv` rows typed by hand survive every rerun: without `--selects`, existing
+  rows are kept by clip and only new clips are appended. `--selects` replaces the rows;
+  `--reset-cards` empties them.
+- Two inputs with the same stem (two dumps of a `C0001.MP4`) stop the run, because they would
+  share one index folder.
 - Hashes come from the dump's ingest manifests when the clip is there; otherwise the file is
   hashed.
 - Rotation is honoured: a Sony clip tagged 90 degrees indexes as 1080x1920.
@@ -106,7 +112,13 @@ For every row of `<workdir>/shot-cards.csv`, one pre-trimmed clip. Plus identity
   `vclip` uses for a local file: libx264 crf 18, preset fast, AAC audio, exact cut, native
   frame rate, autorotation applied once. Nothing else is baked in.
 - `alternates/NNa-<clip>-<in>s-<out>s.mp4`: one per range in the row's `alternates` field.
-- Every output is fully decoded once after the cut (`decode_check`).
+- Every output is fully decoded once after the cut (`decode_check`). The encode writes a
+  `.partial.mp4` and renames on success, so a killed run leaves no half file under the final
+  name.
+- A rerun reuses a clip only when the previous `pack.json` recorded it from the same source
+  bytes and its sha256 still matches; anything else is cut again. Clips from an earlier run
+  that no row produces any more are moved to `index/stale/`, so `clips/` always matches
+  `ORDER.txt`.
 - `--overlays`: a generic-overlays pack folder with `Light/`, `Dark/` and `Brand/`.
 - `--identity`: overlay stem to copy, repeatable, default `630-volleyball`. The tool copies
   `Light/<name>-light.png`, `Dark/<name>-dark.png` and every PNG in `Brand/`. Labels you do
@@ -116,8 +128,8 @@ For every row of `<workdir>/shot-cards.csv`, one pre-trimmed clip. Plus identity
   subject and note, and its alternates. No slogans, no story.
 - `pack.json`: every clip's sha256, bytes, size, frame rate, decode result and encode time,
   the overlays, the originals, and wall time.
-- A row with an empty in or out stops the run and names the rows. A range outside the clip
-  stops it too.
+- A row with an empty in or out stops the run and names the rows. A range outside the clip,
+  or an alternate it cannot read, stops it too and names the clip.
 
 ## shot-cards.csv
 
@@ -129,7 +141,7 @@ The `clip-selects.csv` shape plus one column:
 | `observed_subject` | what is on screen, in plain words |
 | `candidate_in_seconds`, `candidate_out_seconds` | the primary range |
 | `editorial_note` | free text; never the only place a range lives |
-| `alternates` | other ranges on the same clip, `a-b;c-d` in seconds |
+| `alternates` | other ranges on the same clip, `a-b;c-d` in seconds (`6.5–8.5` and `6.5 to 8.5` also read) |
 
 `index` without `--selects` writes one row per clip with empty in and out and a note pointing
 at the sheet. Fill the ranges from the sheets (or a `detail` sheet), then run `pack`. The

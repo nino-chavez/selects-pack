@@ -112,26 +112,36 @@ def ranges_field(ranges) -> str:
     return ';'.join(f'{fmt_seconds(a)}-{fmt_seconds(b)}' for a, b in ranges)
 
 
-def parse_ranges_field(field: str):
+def parse_ranges_field(field: str, clip: str = '?'):
+    """The alternates column: ranges separated by ';', each in any form RANGE_RE accepts."""
     out = []
     for part in (field or '').split(';'):
         part = part.strip()
         if not part:
             continue
-        a, b = part.split('-', 1)
-        out.append((float(a), float(b)))
+        found = parse_ranges(part)
+        if len(found) != 1:
+            raise SystemExit(f'{clip}: cannot read alternate {part!r}; write it as in-out in seconds, e.g. 6.5-8.5')
+        out.append(found[0])
     return out
 
 
+def source_key(path: Path, st=None):
+    """A card file's identity: path alone is not enough, because a reformatted Sony card mounts
+    at the same path and restarts clip numbering, so C0001.MP4 recurs with different bytes."""
+    st = st or path.stat()
+    return (str(path), st.st_size, st.st_mtime_ns)
+
+
 def read_prior_manifests(dest: Path, skip: Path | None = None) -> dict:
-    """Every earlier ingest-manifest.json under <dest>/review, keyed by source path."""
+    """Every earlier ingest-manifest.json under <dest>/review, keyed by (source, bytes, mtime_ns)."""
     rows = {}
     for m in sorted(dest.glob('review/*/batch-*/ingest-manifest.json')):
         if skip is not None and m.resolve() == skip.resolve():
             continue
         try:
             for r in json.loads(m.read_text()).get('files', []):
-                rows[r['source']] = r
+                rows[(r['source'], r['bytes'], r['source_mtime_ns'])] = r
         except (OSError, ValueError, KeyError):
             continue
     return rows
@@ -172,7 +182,7 @@ def cmd_ingest(a) -> int:
     previous = read_prior_manifests(dest, skip=manifest)
     review.mkdir(parents=True, exist_ok=True)
     files = inventory(roots)
-    required = sum(p.stat().st_size for _, p in files if str(p) not in previous)
+    required = sum(p.stat().st_size for _, p in files if source_key(p) not in previous)
     if shutil.disk_usage(dest).free < required + 1024 ** 3:
         print(f'Insufficient SSD free space: need {required:,} bytes plus 1 GiB headroom', file=sys.stderr)
         return 2
@@ -190,11 +200,11 @@ def cmd_ingest(a) -> int:
             return 'photo-original', dest / 'photo' / src.name
         if suffix == '.XML' and src.name.startswith('C') and 'CLIP' in rel.parts:
             return 'video-sidecar', dest / 'video' / src.name
-        prior = previous.get(str(src))
+        prior = previous.get(source_key(src))
         return 'camera-support', Path(prior['destination']) if prior else support_root / slug / rel
 
     # Copy new media first, newest first, so previews need not wait on older recordings.
-    files.sort(key=lambda rp: (str(rp[1]) in previous, -rp[1].stat().st_mtime))
+    files.sort(key=lambda rp: (source_key(rp[1]) in previous, -rp[1].stat().st_mtime))
     report = {'date': a.date, 'batch': a.batch, 'sources': [str(r) for r in roots],
               'card_profiles': {str(r): profiles[r] for r in roots},
               'destination': str(dest), 'state': 'copying',
@@ -202,12 +212,12 @@ def cmd_ingest(a) -> int:
               'verification': 'SHA256 source and SSD readback, with source stat stable across each file',
               'metadata_policy': 'Preserve modification times, not camera filesystem flags', 'files': []}
     old = json.loads(manifest.read_text()) if manifest.exists() else {'files': []}
-    earlier = {r['source']: r for r in old['files']}
+    earlier = {(r['source'], r['bytes'], r['source_mtime_ns']): r for r in old['files']}
     write_json(manifest, report)
     for i, (root, src) in enumerate(files, 1):
         before = src.stat()
         kind, target = classify(root, src)
-        prior = previous.get(str(src))
+        prior = previous.get(source_key(src, before))
         source_hash = digest(src) if target.exists() else None
         collision = False
         if target.exists() and digest(target) != source_hash:
@@ -246,7 +256,7 @@ def cmd_ingest(a) -> int:
             raise RuntimeError(f'Source changed during ingest: {src}')
         row = {'source': str(src), 'destination': str(target), 'kind': kind,
                'source_id': target.stem,
-               'new_this_ingest': earlier.get(str(src), {}).get('new_this_ingest', new),
+               'new_this_ingest': earlier.get(source_key(src, before), {}).get('new_this_ingest', new),
                'operation': operation, 'bytes': before.st_size, 'sha256': source_hash,
                'source_mtime_ns': before.st_mtime_ns, 'source_stable': True,
                'filename_collision': collision,
@@ -386,9 +396,14 @@ def index_one(src: Path, out_dir: Path, sha: str | None, sheet_fps: float, force
     return meta
 
 
-def seed_shot_cards(path: Path, metas: list[dict], selects: Path | None) -> int:
+def seed_shot_cards(path: Path, metas: list[dict], selects: Path | None, keep_existing: bool) -> int:
+    """Write shot-cards.csv. Rows typed by hand survive: without --selects an existing file is
+    merged by clip and only clips it lacks are appended."""
     by_clip = {m['clip']: m for m in metas}
     rows = []
+    if selects is None and keep_existing and path.exists():
+        with path.open(newline='') as f:
+            rows = [{k: r.get(k, '') for k in SHOT_CARD_FIELDS} for r in csv.DictReader(f)]
     if selects is not None:
         with selects.open(newline='') as f:
             incoming = list(csv.DictReader(f))
@@ -429,6 +444,12 @@ def cmd_index(a) -> int:
     if not clips:
         print('no clips found', file=sys.stderr)
         return 2
+    stems = Counter(c.stem for c in clips)
+    dupes = sorted(k for k, n in stems.items() if n > 1)
+    if dupes:
+        print('two clips share a stem, so they would share an index folder: ' + ', '.join(dupes)
+              + '. Index one dump at a time, or rename one copy.', file=sys.stderr)
+        return 2
     hashes = known_hashes(dest)
     print(f'indexing {len(clips)} clips into {index_dir} ({a.workers} workers)', flush=True)
     metas = []
@@ -442,11 +463,8 @@ def cmd_index(a) -> int:
     order = {c.stem: i for i, c in enumerate(clips)}
     metas.sort(key=lambda m: order[m['clip']])
     cards = out / 'shot-cards.csv'
-    if cards.exists() and not a.selects and not a.force:
-        print(f'kept existing {cards}')
-        todo = None
-    else:
-        todo = seed_shot_cards(cards, metas, Path(a.selects).expanduser() if a.selects else None)
+    todo = seed_shot_cards(cards, metas, Path(a.selects).expanduser() if a.selects else None,
+                           keep_existing=not a.reset_cards)
     wall = round(time.monotonic() - t0, 1)
     write_json(index_dir / 'index.json', {
         'index_version': INDEX_VERSION, 'clips': [{k: v for k, v in m.items() if k != 'probe'} for m in metas],
@@ -480,15 +498,22 @@ def cmd_detail(a) -> int:
 
 def trim(src: Path, start: float, end: float, out: Path, log: Path) -> None:
     # The same encode vclip uses for a local file: exact cut, native frame rate, camera sound kept.
+    partial = out.with_name(out.name + '.partial.mp4')
     run(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y', '-ss', fmt_seconds(start), '-to', fmt_seconds(end),
          '-i', str(src), '-c:v', 'libx264', '-preset', 'fast', '-crf', '18', '-c:a', 'aac',
-         '-movflags', '+faststart', str(out)], timeout=1800, log=log)
+         '-movflags', '+faststart', str(partial)], timeout=1800, log=log)
+    os.replace(partial, out)
 
 
-def cut_one(job: dict, log_dir: Path) -> dict:
+def cut_one(job: dict, log_dir: Path, vouched: dict) -> dict:
+    """Cut one range. An existing file is reused only when the previous pack.json recorded it
+    from the same source bytes and its sha256 still matches; anything else is re-encoded."""
     t0 = time.monotonic()
     out = Path(job['out'])
-    if not out.exists():
+    prior = vouched.get(job['rel'])
+    reused = (out.exists() and prior is not None and prior.get('source_sha256') == job['source_sha256']
+              and digest(out) == prior.get('sha256'))
+    if not reused:
         trim(Path(job['source']), job['in'], job['out_s'], out, log_dir / (out.stem + '.log'))
     t1 = time.monotonic()
     run(['ffmpeg', '-v', 'error', '-i', str(out), '-f', 'null', '-'], timeout=600)
@@ -496,7 +521,7 @@ def cut_one(job: dict, log_dir: Path) -> dict:
     return {**{k: v for k, v in job.items() if k not in ('out',)}, 'file': job['rel'],
             'sha256': digest(out), 'bytes': out.stat().st_size, 'width': pr['width'], 'height': pr['height'],
             'frame_rate': pr['frame_rate'], 'duration_seconds': round(pr['duration_seconds'], 3),
-            'decode_check': 'passed', 'encode_seconds': round(t1 - t0, 2)}
+            'decode_check': 'passed', 'reused': reused, 'encode_seconds': round(t1 - t0, 2)}
 
 
 def collect_overlays(overlays: Path, identities: list[str]) -> list[tuple[Path, str]]:
@@ -558,7 +583,7 @@ def cmd_pack(a) -> int:
         jobs.append({'order': n, 'clip': r['clip'], 'role': 'primary', 'source': m['source'], 'source_sha256': m['sha256'],
                      'in': start, 'out_s': end, 'observed_subject': r['observed_subject'],
                      'editorial_note': r['editorial_note'], 'rel': f'clips/{name}', 'out': str(clips_dir / name)})
-        for k, (s2, e2) in enumerate(parse_ranges_field(r.get('alternates', ''))):
+        for k, (s2, e2) in enumerate(parse_ranges_field(r.get('alternates', ''), r['clip'])):
             if not (0 <= s2 < e2 <= dur + 0.05):
                 print(f'{r["clip"]}: alternate {s2}-{e2} is outside 0-{fmt_seconds(dur)}', file=sys.stderr)
                 return 2
@@ -568,15 +593,34 @@ def cmd_pack(a) -> int:
             jobs.append({'order': n, 'clip': r['clip'], 'role': f'alternate-{chr(97 + k)}', 'source': m['source'],
                          'source_sha256': m['sha256'], 'in': s2, 'out_s': e2, 'observed_subject': r['observed_subject'],
                          'editorial_note': '', 'rel': f'alternates/{name2}', 'out': str(alt_dir / name2)})
+    expected = {Path(j['out']).resolve() for j in jobs}
+    stale_dir = index_dir / 'stale'
+    stale = [p for d in (clips_dir, alt_dir) if d.is_dir() for p in d.glob('*.mp4') if p.resolve() not in expected]
+    for p in stale:
+        # A file from an earlier run whose row changed or went away. Moved, not deleted, so the
+        # folder dragged into CapCut matches ORDER.txt and nothing is lost.
+        stale_dir.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(p), stale_dir / p.name)
+    if stale:
+        print(f'moved {len(stale)} clip(s) from earlier runs to {stale_dir}', flush=True)
+    previous_pack = root / 'pack.json'
+    vouched = {}
+    if previous_pack.exists():
+        try:
+            old = json.loads(previous_pack.read_text())
+            vouched = {r['file']: r for r in old.get('selects', []) + old.get('alternates', [])}
+        except (OSError, ValueError, KeyError):
+            vouched = {}
     print(f'cutting {sum(j["role"] == "primary" for j in jobs)} selects and '
           f'{sum(j["role"] != "primary" for j in jobs)} alternates with {a.workers} workers', flush=True)
     results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=a.workers) as pool:
-        futs = {pool.submit(cut_one, j, log_dir): j for j in jobs}
+        futs = {pool.submit(cut_one, j, log_dir, vouched): j for j in jobs}
         for fut in concurrent.futures.as_completed(futs):
             res = fut.result()
             results.append(res)
-            print(f"  {res['file']}: {res['duration_seconds']}s {res['width']}x{res['height']} ({res['encode_seconds']}s)", flush=True)
+            tag = 'reused' if res['reused'] else f"{res['encode_seconds']}s"
+            print(f"  {res['file']}: {res['duration_seconds']}s {res['width']}x{res['height']} ({tag})", flush=True)
     results.sort(key=lambda r: (r['order'], r['role']))
 
     copied = []
@@ -625,6 +669,7 @@ def cmd_pack(a) -> int:
         'selects': primaries, 'alternates': [r for r in results if r['role'] != 'primary'],
         'overlays': copied, 'originals': [{'path': p, 'sha256': h} for p, h in sources],
         'timings': {'wall_seconds': wall, 'encode_seconds_total': round(sum(r['encode_seconds'] for r in results), 1),
+                    'reused_clips': sum(1 for r in results if r['reused']), 'stale_moved': len(stale),
                     'workers': a.workers}})
     print(f'{len(primaries)} selects, {len(results) - len(primaries)} alternates, {len(copied)} overlays in {wall}s -> {root}')
     return 0
@@ -651,7 +696,9 @@ def main(argv=None) -> int:
     p.add_argument('--dest', default='/Volumes/photo/2026-dump', help='dump root whose manifests supply known hashes')
     p.add_argument('--sheet-fps', type=float, default=1.0, help='frames per second on the contact sheet (default 1)')
     p.add_argument('--workers', type=int, default=3)
-    p.add_argument('--force', action='store_true', help='rebuild proxies, sheets and shot-cards.csv')
+    p.add_argument('--force', action='store_true', help='rebuild proxies and sheets even when cached')
+    p.add_argument('--reset-cards', action='store_true',
+                   help='throw away the existing shot-cards.csv rows (without this they are merged by clip)')
     p.set_defaults(fn=cmd_index)
 
     p = sub.add_parser('detail', help='a finer contact sheet for one range of one indexed clip')

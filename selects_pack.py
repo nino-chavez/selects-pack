@@ -133,17 +133,32 @@ def source_key(path: Path, st=None):
     return (str(path), st.st_size, st.st_mtime_ns)
 
 
+def prior_row(rows: dict, path: Path, st=None):
+    """A manifest row for this card file: exact (source, bytes, mtime_ns) first, then
+    (source, bytes) for rows written before mtime was recorded (batch-2 has none)."""
+    st = st or path.stat()
+    return rows.get((str(path), st.st_size, st.st_mtime_ns)) or rows.get((str(path), st.st_size))
+
+
 def read_prior_manifests(dest: Path, skip: Path | None = None) -> dict:
-    """Every earlier ingest-manifest.json under <dest>/review, keyed by (source, bytes, mtime_ns)."""
+    """Every earlier ingest-manifest.json under <dest>/review. Each row is keyed by
+    (source, bytes, mtime_ns) when the row has an mtime, and always by (source, bytes)."""
     rows = {}
     for m in sorted(dest.glob('review/*/batch-*/ingest-manifest.json')):
         if skip is not None and m.resolve() == skip.resolve():
             continue
         try:
-            for r in json.loads(m.read_text()).get('files', []):
-                rows[(r['source'], r['bytes'], r['source_mtime_ns'])] = r
-        except (OSError, ValueError, KeyError):
+            manifest_rows = json.loads(m.read_text()).get('files', [])
+        except (OSError, ValueError) as e:
+            print(f'warning: cannot read {m}: {e}', file=sys.stderr)
             continue
+        for r in manifest_rows:
+            try:
+                rows[(r['source'], r['bytes'])] = r
+                if r.get('source_mtime_ns') is not None:
+                    rows[(r['source'], r['bytes'], r['source_mtime_ns'])] = r
+            except KeyError:
+                print(f'warning: {m} has a row without source or bytes; skipped', file=sys.stderr)
     return rows
 
 
@@ -182,7 +197,7 @@ def cmd_ingest(a) -> int:
     previous = read_prior_manifests(dest, skip=manifest)
     review.mkdir(parents=True, exist_ok=True)
     files = inventory(roots)
-    required = sum(p.stat().st_size for _, p in files if source_key(p) not in previous)
+    required = sum(p.stat().st_size for _, p in files if prior_row(previous, p) is None)
     if shutil.disk_usage(dest).free < required + 1024 ** 3:
         print(f'Insufficient SSD free space: need {required:,} bytes plus 1 GiB headroom', file=sys.stderr)
         return 2
@@ -200,11 +215,11 @@ def cmd_ingest(a) -> int:
             return 'photo-original', dest / 'photo' / src.name
         if suffix == '.XML' and src.name.startswith('C') and 'CLIP' in rel.parts:
             return 'video-sidecar', dest / 'video' / src.name
-        prior = previous.get(source_key(src))
+        prior = prior_row(previous, src)
         return 'camera-support', Path(prior['destination']) if prior else support_root / slug / rel
 
     # Copy new media first, newest first, so previews need not wait on older recordings.
-    files.sort(key=lambda rp: (source_key(rp[1]) in previous, -rp[1].stat().st_mtime))
+    files.sort(key=lambda rp: (prior_row(previous, rp[1]) is not None, -rp[1].stat().st_mtime))
     report = {'date': a.date, 'batch': a.batch, 'sources': [str(r) for r in roots],
               'card_profiles': {str(r): profiles[r] for r in roots},
               'destination': str(dest), 'state': 'copying',
@@ -217,7 +232,7 @@ def cmd_ingest(a) -> int:
     for i, (root, src) in enumerate(files, 1):
         before = src.stat()
         kind, target = classify(root, src)
-        prior = previous.get(source_key(src, before))
+        prior = prior_row(previous, src, before)
         source_hash = digest(src) if target.exists() else None
         collision = False
         if target.exists() and digest(target) != source_hash:
@@ -594,11 +609,11 @@ def cmd_pack(a) -> int:
                          'source_sha256': m['sha256'], 'in': s2, 'out_s': e2, 'observed_subject': r['observed_subject'],
                          'editorial_note': '', 'rel': f'alternates/{name2}', 'out': str(alt_dir / name2)})
     expected = {Path(j['out']).resolve() for j in jobs}
-    stale_dir = index_dir / 'stale'
+    stale_dir = index_dir / 'stale' / time.strftime('%Y%m%d-%H%M%S')
     stale = [p for d in (clips_dir, alt_dir) if d.is_dir() for p in d.glob('*.mp4') if p.resolve() not in expected]
     for p in stale:
-        # A file from an earlier run whose row changed or went away. Moved, not deleted, so the
-        # folder dragged into CapCut matches ORDER.txt and nothing is lost.
+        # A file from an earlier run whose row changed or went away. Moved, not deleted, into a
+        # folder named for this run, so a name that comes back later never overwrites it.
         stale_dir.mkdir(parents=True, exist_ok=True)
         shutil.move(str(p), stale_dir / p.name)
     if stale:

@@ -56,7 +56,7 @@ Copy-only ingest of mounted cards into the existing SSD layout, lifted from the 
 - Earlier manifests under `<dest>/review/*/batch-*/` supply `previous_sha256` and keep
   camera-support files at the destination they already have. A prior row matches on path,
   size and mtime together, because a reformatted Sony card mounts at the same path and
-  restarts clip numbering.
+  restarts clip numbering. Rows written before mtime was recorded match on path and size.
 - Needs free space for the new files plus 1 GiB, or it stops before copying.
 - The manifest is the batch-3 shape plus `source_id` (the destination stem) and
   `card_profiles`. It is rewritten after every file, so a stopped run can be rerun.
@@ -117,8 +117,8 @@ For every row of `<workdir>/shot-cards.csv`, one pre-trimmed clip. Plus identity
   name.
 - A rerun reuses a clip only when the previous `pack.json` recorded it from the same source
   bytes and its sha256 still matches; anything else is cut again. Clips from an earlier run
-  that no row produces any more are moved to `index/stale/`, so `clips/` always matches
-  `ORDER.txt`.
+  that no row produces any more are moved to `index/stale/<run time>/`, so `clips/` always
+  matches `ORDER.txt` and nothing is overwritten.
 - `--overlays`: a generic-overlays pack folder with `Light/`, `Dark/` and `Brand/`.
 - `--identity`: overlay stem to copy, repeatable, default `630-volleyball`. The tool copies
   `Light/<name>-light.png`, `Dark/<name>-dark.png` and every PNG in `Brand/`. Labels you do

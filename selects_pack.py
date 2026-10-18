@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """selects-pack: card -> verified SSD copy -> indexed clips -> CapCut-ready selects pack.
 
-Four subcommands, lifted from the TPS opening-weekend campaign scripts (2026-10-17):
+Subcommands, the first four lifted from the TPS opening-weekend campaign scripts (2026-10-17):
 
   ingest  copy-only ingest with sha256 verification into the /Volumes/photo/2026-dump layout
   index   per clip: ffprobe metadata, a low-res proxy, a contact sheet, and shot-cards.csv
   detail  a finer contact sheet for one time range of one clip (the moment-finding aid)
   pack    one pre-trimmed clip per shot-card row, identity overlays, originals.txt, ORDER.txt
+  edl     read a CapCut draft (an accepted cut) into an edit decision list JSON
   draft   (spike) stage a new CapCut project from a selects pack
 
 The cut stays with the editor. This tool ends at a folder that can be dragged into CapCut.
@@ -692,12 +693,162 @@ def cmd_pack(a) -> int:
     return 0
 
 
+# ---------------------------------------------------------------- edl
+
+US = 1_000_000  # CapCut stores times in microseconds; seconds are value / 1e6, unrounded
+
+
+def read_capcut_draft(draft: Path) -> dict:
+    """An edit decision list from a CapCut draft_info.json: every video-type track (footage and
+    imported PNG overlays), each segment's timeline position, source in-point and speed."""
+    data = draft.read_bytes()
+    d = json.loads(data)
+    mats = {m['id']: m for m in d['materials'].get('videos', [])}
+    tracks = []
+    for index, t in enumerate(d['tracks']):
+        if t.get('type') != 'video':
+            continue
+        clips = []
+        for seg in t['segments']:
+            m = mats.get(seg['material_id'], {})
+            tgt = seg['target_timerange']
+            src = seg.get('source_timerange') or {'start': 0, 'duration': tgt['duration']}
+            path = m.get('path', '')
+            clips.append({'start_s': tgt['start'] / US, 'duration_s': tgt['duration'] / US,
+                          'source': Path(path).name, 'source_start_s': src['start'] / US,
+                          'speed': float(seg.get('speed', 1.0)),
+                          'kind': m.get('type', ''), 'source_path': path,
+                          'source_duration_s': src['duration'] / US,
+                          'end_s': (tgt['start'] + tgt['duration']) / US})
+        tracks.append({'track_index': index, 'type': 'video', 'clips': clips})
+    return {'source_project': str(draft), 'source_project_sha256': hashlib.sha256(data).hexdigest(),
+            'duration_s': d['duration'] / US, 'fps': float(d['fps']),
+            'canvas': {k: d.get('canvas_config', {}).get(k) for k in ('width', 'height')},
+            'material_counts': {k: len(v) for k, v in d['materials'].items() if isinstance(v, list)},
+            'video_tracks': tracks}
+
+
+def project_onto(ref, value):
+    """Keep only the keys the reference has, recursively, so extra EDL fields are not diffed."""
+    if isinstance(ref, dict) and isinstance(value, dict):
+        return {k: project_onto(ref[k], value.get(k)) for k in ref}
+    if isinstance(ref, list) and isinstance(value, list):
+        return [project_onto(r, v) for r, v in zip(ref, value)] + value[len(ref):]
+    return value
+
+
+def diff_values(ref, got, path='') -> list[str]:
+    if isinstance(ref, dict) and isinstance(got, dict):
+        out = []
+        for k in ref:
+            out += diff_values(ref[k], got.get(k, '<missing>'), f'{path}.{k}' if path else k)
+        return out
+    if isinstance(ref, list) and isinstance(got, list):
+        out = [] if len(ref) == len(got) else [f'{path}: {len(ref)} items in reference, {len(got)} read']
+        for i, (r, g) in enumerate(zip(ref, got)):
+            out += diff_values(r, g, f'{path}[{i}]')
+        return out
+    return [] if ref == got else [f'{path}: reference {ref!r}, read {got!r}']
+
+
+REASON_FIELDS = ['track_index', 'start_s', 'source', 'source_start_s', 'verdict', 'reason']
+
+
+def segment_keys(edl: dict) -> dict:
+    """(track_index, start_s) -> clip, refusing a cut where two segments share a key."""
+    clips = {}
+    for t in edl['video_tracks']:
+        for c in t['clips']:
+            key = (t['track_index'], round(c['start_s'], 6))
+            if key in clips:
+                raise SystemExit(f'two segments start at {key[1]} s on track {key[0]}; reasons cannot tell them apart')
+            clips[key] = c
+    return clips
+
+
+def apply_reasons(edl: dict, reasons: Path) -> int:
+    """Merge reasons onto clips. A row with track_index and start_s names one segment of the cut.
+    A row without them (a rejected take, a reference that is not in the cut) is kept whole under
+    rejected_references, so no row is dropped."""
+    with reasons.open(newline='', encoding='utf-8-sig') as f:  # Excel's CSV UTF-8 adds a byte-order mark
+        reader = csv.DictReader(f, restval='')
+        missing = [c for c in ('track_index', 'start_s', 'verdict') if c not in (reader.fieldnames or [])]
+        if missing:
+            raise SystemExit(f'{reasons} lacks columns {missing}; columns are {", ".join(REASON_FIELDS)}')
+        rows = [{k: (v or '').strip() for k, v in r.items() if k is not None} for r in reader]
+    clips = segment_keys(edl)
+    seen, hit, unplaced = set(), 0, []
+    for r in rows:
+        if r.get('track_index', '') == '' or r.get('start_s', '') == '':
+            if r.get('verdict', '').strip().lower() == 'accepted':
+                raise SystemExit(f'an accepted row has no track_index/start_s ({r.get("source")}); '
+                                 'accepted rows must name their segment')
+            unplaced.append({k: r.get(k, '') for k in ('source', 'source_start_s', 'verdict', 'reason')})
+            continue
+        key = (int(r['track_index']), round(float(r['start_s']), 6))
+        if key in seen:
+            raise SystemExit(f'reasons file names segment track {key[0]} at {key[1]} s twice')
+        seen.add(key)
+        c = clips.get(key)
+        if c is None:
+            raise SystemExit(f'reasons file names track {key[0]} at {key[1]} s, which is not a segment of this cut')
+        c['verdict'], c['reason'] = r.get('verdict', ''), r.get('reason', '')
+        hit += 1
+    edl['rejected_references'] = unplaced
+    edl['reasons_file'] = str(reasons)
+    return hit
+
+
+def cmd_edl(a) -> int:
+    draft = Path(a.draft).expanduser()
+    if draft.is_dir():
+        draft = draft / 'draft_info.json'
+    edl = read_capcut_draft(draft)
+    if a.reasons_template:
+        tpl = Path(a.reasons_template).expanduser()
+        if tpl.exists():
+            print(f'{tpl} already exists; the template never overwrites a reasons file', file=sys.stderr)
+            return 2
+        segment_keys(edl)  # refuse before anyone fills in a template that could never be applied
+    if a.reasons:
+        n = apply_reasons(edl, Path(a.reasons).expanduser())
+        print(f'reasons placed on {n} clips; {len(edl["rejected_references"])} rejected or unplaced references kept')
+    out = Path(a.out).expanduser()
+    write_json(out, edl)
+    segs = sum(len(t['clips']) for t in edl['video_tracks'])
+    print(f'{segs} segments on {len(edl["video_tracks"])} video tracks, {edl["duration_s"]} s -> {out}')
+    if a.reasons_template:
+        with tpl.open('x', newline='') as f:
+            w = csv.writer(f)
+            w.writerow(REASON_FIELDS)
+            for t in edl['video_tracks']:
+                for c in t['clips']:
+                    w.writerow([t['track_index'], c['start_s'], c['source'], c['source_start_s'], 'accepted', ''])
+        print(f'reasons template: {tpl} (one row per segment; add rejected references as rows with '
+              f'track_index and start_s left empty)')
+    if a.compare:
+        ref = json.loads(Path(a.compare).expanduser().read_text())
+        want = ref.get('source_project_sha256')
+        if want and want != edl['source_project_sha256']:
+            print(f'refusing to compare: the draft hashes {edl["source_project_sha256"][:12]}, the reference was '
+                  f'read from {want[:12]}. CapCut rewrites the draft while it is open.', file=sys.stderr)
+            return 3
+        ignore = set(a.ignore or [])
+        ref_cmp = {k: v for k, v in ref.items() if k not in ignore}
+        problems = diff_values(ref_cmp, project_onto(ref_cmp, edl))
+        if problems:
+            print(f'{len(problems)} difference(s) from {a.compare}:')
+            for p in problems:
+                print('  ' + p)
+            return 1
+        print(f'matches {a.compare} on every compared field (ignored: {", ".join(sorted(ignore)) or "none"})')
+    return 0
+
 # ---------------------------------------------------------------- draft (spike)
 
 import copy
 import uuid
 
-US = 1_000_000
 CAPCUT_DRAFTS = Path.home() / 'Movies/CapCut/User Data/Projects/com.lveditor.draft'
 SEGMENT_REF_TYPES = ['speeds', 'placeholder_infos', 'canvases', 'material_animations',
                      'sound_channel_mappings', 'material_colors', 'loudnesses', 'vocal_separations']
@@ -918,6 +1069,15 @@ def main(argv=None) -> int:
     p.add_argument('--workers', type=int, default=3)
     p.set_defaults(fn=cmd_pack)
 
+    p = sub.add_parser('edl', help='read a CapCut draft into an edit decision list (JSON)')
+    p.add_argument('draft', help='CapCut project folder or its draft_info.json (read only)')
+    p.add_argument('--out', required=True, help='EDL JSON to write')
+    p.add_argument('--reasons', help='CSV of track_index, start_s, source, source_start_s, verdict, reason '
+                   '(the --reasons-template shape) to merge onto clips')
+    p.add_argument('--reasons-template', help='write a reasons CSV with one row per segment to fill in')
+    p.add_argument('--compare', help='reference EDL/summary JSON; exit 1 on any difference')
+    p.add_argument('--ignore', action='append', help='top-level reference key to leave out of --compare, repeatable')
+    p.set_defaults(fn=cmd_edl)
     p = sub.add_parser('draft', help='(spike) stage a new CapCut project from a selects pack')
     p.add_argument('pack', help='selects pack folder holding pack.json')
     p.add_argument('--template', required=True, help='an existing CapCut project folder, read only, for file shapes')

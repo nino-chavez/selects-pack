@@ -131,6 +131,34 @@ For every row of `<workdir>/shot-cards.csv`, one pre-trimmed clip. Plus identity
 - A row with an empty in or out stops the run and names the rows. A range outside the clip,
   or an alternate it cannot read, stops it too and names the clip.
 
+### edl
+
+    selects-pack edl <capcut-project> --out FILE [--reasons CSV] [--reasons-template CSV] [--compare REF] [--ignore KEY]...
+
+Reads a CapCut project's `draft_info.json` and writes an edit decision list as JSON. It
+never writes to the project.
+
+- Every video-type track is read, footage and imported PNG overlays alike. `track_index` is
+  the position in CapCut's full track list, so filter and adjust tracks leave gaps.
+- Each clip records `start_s`, `duration_s`, `source` (file name), `source_start_s` and
+  `speed`, plus `kind`, `source_path`, `source_duration_s` and `end_s`.
+- Times are CapCut's microseconds divided by a million, unrounded.
+- `material_counts`, `duration_s`, `fps`, `canvas` and the draft's sha256 are recorded too.
+- `--reasons-template`: one CSV row per segment (`track_index`, `start_s`, `source`,
+  `source_start_s`, `verdict`, `reason`) for a person to fill. It never overwrites a file.
+- `--reasons`: places each row on the segment its `track_index` and `start_s` name. Rows
+  with those two left empty, such as rejected takes, are kept under `rejected_references`.
+  A row naming a segment twice, or a segment the cut lacks, stops the run.
+- `--compare`: diffs against a reference JSON on the reference's own keys only, with exact
+  equality, and exits 1 naming each differing field. It refuses (exit 3) when the draft's
+  sha256 differs from the reference's `source_project_sha256`, because CapCut rewrites an
+  open draft. `--ignore` leaves a top-level reference key out, such as the prose `limits`.
+
+Measured 2026-10-18 on project 1017 (Nino's TPS day-one cut): 25 segments on 8 video
+tracks, 53.866666 s. The EDL matches 630-marketing-automation's
+`capcut-project-summary.json` on every field except the ignored `limits`. Two planted
+wrong values in a copy of the reference were both named, and a planted wrong hash was
+refused.
 ### draft (spike)
 
     selects-pack draft <pack> --template <capcut-project> --stage DIR [--name NAME] [--identity STEM]... [--overlay-seconds N]

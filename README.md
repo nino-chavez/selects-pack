@@ -167,8 +167,9 @@ all, 111.9 s selected.
 | `pack`: 30 selects, 17 alternates, 10 identity overlays, 30 originals hashed | 463 MB of selects, 99 MB of alternates; every decode check passed | 232.8 s wall, 565 s encode |
 
 Output: `~/Workspace/create/campaigns/tps-opening-weekend-2026-10-17/selects-pack-v2/`, with
-`--identity 630-volleyball the-point-series day-one day-two`. Timings are in
-`index/index.json` and `pack.json`. The shot cards reproduce the 30 `clip-selects.csv` rows
+`--identity 630-volleyball the-point-series day-one day-two`. The first-run logs are
+`index/first-index-run.log` and `index/first-pack-run.log`. `pack.json` holds the latest
+run, which reused 46 clips after a planted-failure rerun. The shot cards reproduce the 30 `clip-selects.csv` rows
 column for column. Cut exactness was checked on six selects: the first frame of each trimmed
 clip differs from the source frame at its in-point by under 1 grey level on average, and from
 the frame half a second later by 20 to 73, so the check can fail and did not. `ingest` was exercised on a scratch card

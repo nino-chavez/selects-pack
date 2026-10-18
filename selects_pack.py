@@ -142,7 +142,7 @@ def prior_row(rows: dict, path: Path, st=None):
 
 def read_prior_manifests(dest: Path, skip: Path | None = None) -> dict:
     """Every earlier ingest-manifest.json under <dest>/review. Each row is keyed by
-    (source, bytes, mtime_ns) when the row has an mtime, and always by (source, bytes)."""
+    (source, bytes, mtime_ns) when the row has an mtime, and by (source, bytes) only when it has none."""
     rows = {}
     for m in sorted(dest.glob('review/*/batch-*/ingest-manifest.json')):
         if skip is not None and m.resolve() == skip.resolve():
@@ -154,8 +154,9 @@ def read_prior_manifests(dest: Path, skip: Path | None = None) -> dict:
             continue
         for r in manifest_rows:
             try:
-                rows[(r['source'], r['bytes'])] = r
-                if r.get('source_mtime_ns') is not None:
+                if r.get('source_mtime_ns') is None:
+                    rows[(r['source'], r['bytes'])] = r  # older manifests (batch-2) record no mtime
+                else:
                     rows[(r['source'], r['bytes'], r['source_mtime_ns'])] = r
             except KeyError:
                 print(f'warning: {m} has a row without source or bytes; skipped', file=sys.stderr)
@@ -609,7 +610,7 @@ def cmd_pack(a) -> int:
                          'source_sha256': m['sha256'], 'in': s2, 'out_s': e2, 'observed_subject': r['observed_subject'],
                          'editorial_note': '', 'rel': f'alternates/{name2}', 'out': str(alt_dir / name2)})
     expected = {Path(j['out']).resolve() for j in jobs}
-    stale_dir = index_dir / 'stale' / time.strftime('%Y%m%d-%H%M%S')
+    stale_dir = index_dir / 'stale' / f"{time.strftime('%Y%m%d-%H%M%S')}-{time.time_ns() % 10**9:09d}"
     stale = [p for d in (clips_dir, alt_dir) if d.is_dir() for p in d.glob('*.mp4') if p.resolve() not in expected]
     for p in stale:
         # A file from an earlier run whose row changed or went away. Moved, not deleted, into a

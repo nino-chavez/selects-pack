@@ -757,11 +757,24 @@ def apply_reasons(edl: dict, reasons: Path) -> int:
     A row without them (a rejected take, a reference that is not in the cut) is kept whole under
     rejected_references, so no row is dropped."""
     with reasons.open(newline='') as f:
-        rows = list(csv.DictReader(f))
-    clips = {(t['track_index'], round(c['start_s'], 6)): c for t in edl['video_tracks'] for c in t['clips']}
+        reader = csv.DictReader(f)
+        missing = [c for c in ('track_index', 'start_s', 'verdict') if c not in (reader.fieldnames or [])]
+        if missing:
+            raise SystemExit(f'{reasons} lacks columns {missing}; columns are {", ".join(REASON_FIELDS)}')
+        rows = list(reader)
+    clips = {}
+    for t in edl['video_tracks']:
+        for c in t['clips']:
+            key = (t['track_index'], round(c['start_s'], 6))
+            if key in clips:
+                raise SystemExit(f'two segments start at {key[1]} s on track {key[0]}; reasons cannot tell them apart')
+            clips[key] = c
     seen, hit, unplaced = set(), 0, []
     for r in rows:
         if r.get('track_index', '') == '' or r.get('start_s', '') == '':
+            if r.get('verdict', '').strip().lower() == 'accepted':
+                raise SystemExit(f'an accepted row has no track_index/start_s ({r.get("source")}); '
+                                 'accepted rows must name their segment')
             unplaced.append({k: r.get(k, '') for k in ('source', 'source_start_s', 'verdict', 'reason')})
             continue
         key = (int(r['track_index']), round(float(r['start_s']), 6))
@@ -871,7 +884,8 @@ def main(argv=None) -> int:
     p = sub.add_parser('edl', help='read a CapCut draft into an edit decision list (JSON)')
     p.add_argument('draft', help='CapCut project folder or its draft_info.json (read only)')
     p.add_argument('--out', required=True, help='EDL JSON to write')
-    p.add_argument('--reasons', help='CSV of source, source_start_s, verdict, reason to merge onto clips')
+    p.add_argument('--reasons', help='CSV of track_index, start_s, source, source_start_s, verdict, reason '
+                   '(the --reasons-template shape) to merge onto clips')
     p.add_argument('--reasons-template', help='write a reasons CSV with one row per segment to fill in')
     p.add_argument('--compare', help='reference EDL/summary JSON; exit 1 on any difference')
     p.add_argument('--ignore', action='append', help='top-level reference key to leave out of --compare, repeatable')

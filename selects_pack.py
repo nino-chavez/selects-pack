@@ -749,18 +749,31 @@ def diff_values(ref, got, path='') -> list[str]:
     return [] if ref == got else [f'{path}: reference {ref!r}, read {got!r}']
 
 
+REASON_FIELDS = ['track_index', 'start_s', 'source', 'source_start_s', 'verdict', 'reason']
+
+
 def apply_reasons(edl: dict, reasons: Path) -> int:
-    """Merge accepted/rejected reasons (CSV: source, source_start_s, verdict, reason) onto clips."""
+    """Merge reasons onto clips. A row with track_index and start_s names one segment of the cut.
+    A row without them (a rejected take, a reference that is not in the cut) is kept whole under
+    rejected_references, so no row is dropped."""
     with reasons.open(newline='') as f:
         rows = list(csv.DictReader(f))
-    by_key = {(r['source'], round(float(r['source_start_s']), 3)): r for r in rows}
-    hit = 0
-    for t in edl['video_tracks']:
-        for c in t['clips']:
-            r = by_key.get((c['source'], round(c['source_start_s'], 3)))
-            if r:
-                c['verdict'], c['reason'] = r.get('verdict', ''), r.get('reason', '')
-                hit += 1
+    clips = {(t['track_index'], round(c['start_s'], 6)): c for t in edl['video_tracks'] for c in t['clips']}
+    seen, hit, unplaced = set(), 0, []
+    for r in rows:
+        if r.get('track_index', '') == '' or r.get('start_s', '') == '':
+            unplaced.append({k: r.get(k, '') for k in ('source', 'source_start_s', 'verdict', 'reason')})
+            continue
+        key = (int(r['track_index']), round(float(r['start_s']), 6))
+        if key in seen:
+            raise SystemExit(f'reasons file names segment track {key[0]} at {key[1]} s twice')
+        seen.add(key)
+        c = clips.get(key)
+        if c is None:
+            raise SystemExit(f'reasons file names track {key[0]} at {key[1]} s, which is not a segment of this cut')
+        c['verdict'], c['reason'] = r.get('verdict', ''), r.get('reason', '')
+        hit += 1
+    edl['rejected_references'] = unplaced
     edl['reasons_file'] = str(reasons)
     return hit
 
@@ -770,22 +783,27 @@ def cmd_edl(a) -> int:
     if draft.is_dir():
         draft = draft / 'draft_info.json'
     edl = read_capcut_draft(draft)
+    if a.reasons_template:
+        tpl = Path(a.reasons_template).expanduser()
+        if tpl.exists():
+            print(f'{tpl} already exists; the template never overwrites a reasons file', file=sys.stderr)
+            return 2
     if a.reasons:
         n = apply_reasons(edl, Path(a.reasons).expanduser())
-        print(f'reasons matched {n} clips')
+        print(f'reasons placed on {n} clips; {len(edl["rejected_references"])} rejected or unplaced references kept')
     out = Path(a.out).expanduser()
     write_json(out, edl)
     segs = sum(len(t['clips']) for t in edl['video_tracks'])
     print(f'{segs} segments on {len(edl["video_tracks"])} video tracks, {edl["duration_s"]} s -> {out}')
     if a.reasons_template:
-        tpl = Path(a.reasons_template).expanduser()
-        with tpl.open('w', newline='') as f:
+        with tpl.open('x', newline='') as f:
             w = csv.writer(f)
-            w.writerow(['source', 'source_start_s', 'verdict', 'reason'])
+            w.writerow(REASON_FIELDS)
             for t in edl['video_tracks']:
                 for c in t['clips']:
-                    w.writerow([c['source'], c['source_start_s'], 'accepted', ''])
-        print(f'reasons template: {tpl} (one row per segment; rejected references can be added as rows)')
+                    w.writerow([t['track_index'], c['start_s'], c['source'], c['source_start_s'], 'accepted', ''])
+        print(f'reasons template: {tpl} (one row per segment; add rejected references as rows with '
+              f'track_index and start_s left empty)')
     if a.compare:
         ref = json.loads(Path(a.compare).expanduser().read_text())
         want = ref.get('source_project_sha256')

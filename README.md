@@ -144,9 +144,11 @@ never writes to the project.
   `speed`, plus `kind`, `source_path`, `source_duration_s` and `end_s`.
 - Times are CapCut's microseconds divided by a million, unrounded.
 - `material_counts`, `duration_s`, `fps`, `canvas` and the draft's sha256 are recorded too.
-- `--reasons-template`: one CSV row per segment (`source`, `source_start_s`, `verdict`,
-  `reason`) for a person to fill. Rejected references can be added as rows.
-- `--reasons`: merges a filled CSV onto the matching clips as `verdict` and `reason`.
+- `--reasons-template`: one CSV row per segment (`track_index`, `start_s`, `source`,
+  `source_start_s`, `verdict`, `reason`) for a person to fill. It never overwrites a file.
+- `--reasons`: places each row on the segment its `track_index` and `start_s` name. Rows
+  with those two left empty, such as rejected takes, are kept under `rejected_references`.
+  A row naming a segment twice, or a segment the cut lacks, stops the run.
 - `--compare`: diffs against a reference JSON on the reference's own keys only, with exact
   equality, and exits 1 naming each differing field. It refuses (exit 3) when the draft's
   sha256 differs from the reference's `source_project_sha256`, because CapCut rewrites an

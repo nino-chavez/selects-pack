@@ -431,9 +431,11 @@ def index_one(src: Path, out_dir: Path, sha: str | None, sheet_fps: float, force
     return meta
 
 
-def seed_shot_cards(path: Path, metas: list[dict], selects: Path | None, keep_existing: bool) -> int:
+def seed_shot_cards(path: Path, metas: list[dict], selects: Path | None, keep_existing: bool,
+                    failed: frozenset[str] = frozenset()) -> int:
     """Write shot-cards.csv. Rows typed by hand survive: without --selects an existing file is
-    merged by clip and only clips it lacks are appended."""
+    merged by clip and only clips it lacks are appended. A selects row for a clip that failed to
+    index this run is carried through unchanged, so a rerun after the fix still has it."""
     by_clip = {m['clip']: m for m in metas}
     rows = []
     if selects is None and keep_existing and path.exists():
@@ -442,10 +444,14 @@ def seed_shot_cards(path: Path, metas: list[dict], selects: Path | None, keep_ex
     if selects is not None:
         with selects.open(newline='') as f:
             incoming = list(csv.DictReader(f))
-        unknown = [r['clip'] for r in incoming if r['clip'] not in by_clip]
+        unknown = [r['clip'] for r in incoming if r['clip'] not in by_clip and r['clip'] not in failed]
         if unknown:
             raise SystemExit(f'selects name clips that are not indexed: {", ".join(unknown)}')
         for r in incoming:
+            if r['clip'] in failed:
+                print(f"warning: {r['clip']} failed to index; its selects row is kept unchanged", file=sys.stderr)
+                rows.append({k: r.get(k, '') for k in SHOT_CARD_FIELDS})
+                continue
             m = by_clip[r['clip']]
             primary = (float(r['candidate_in_seconds']), float(r['candidate_out_seconds'])) \
                 if r.get('candidate_in_seconds') not in (None, '') else None
@@ -494,8 +500,9 @@ def cmd_index(a) -> int:
             try:
                 m = fut.result()
             except Exception as e:  # one unreadable clip must not cost the rest of the batch its shot cards
-                failed.append({'clip': futures[fut].stem, 'source': str(futures[fut]), 'error': str(e)[-600:]})
-                print(f"  {futures[fut].stem}: FAILED {str(e).splitlines()[0][:200]}", flush=True)
+                message = str(e) or type(e).__name__
+                failed.append({'clip': futures[fut].stem, 'source': str(futures[fut]), 'error': message[-600:]})
+                print(f"  {futures[fut].stem}: FAILED {message.splitlines()[0][:200]}", flush=True)
                 continue
             metas.append(m)
             tag = 'cached' if m['cached'] else f"{m['timings_seconds']['total']}s"
@@ -504,7 +511,7 @@ def cmd_index(a) -> int:
     metas.sort(key=lambda m: order[m['clip']])
     cards = out / 'shot-cards.csv'
     todo = seed_shot_cards(cards, metas, Path(a.selects).expanduser() if a.selects else None,
-                           keep_existing=not a.reset_cards)
+                           keep_existing=not a.reset_cards, failed=frozenset(f['clip'] for f in failed))
     wall = round(time.monotonic() - t0, 1)
     write_json(index_dir / 'index.json', {
         'index_version': INDEX_VERSION, 'clips': [{k: v for k, v in m.items() if k != 'probe'} for m in metas],

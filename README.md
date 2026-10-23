@@ -92,6 +92,10 @@ and one row in `<out>/shot-cards.csv`.
 - Hashes come from the dump's ingest manifests when the clip is there; otherwise the file is
   hashed.
 - Rotation is honoured: a Sony clip tagged 90 degrees indexes as 1080x1920.
+- A clip shorter than one sampling interval, such as a one-frame DJI recording, gets its single
+  frame on the sheet.
+- A clip that cannot be read does not stop the batch. It is listed under `failed` in
+  `index/index.json`, the rest still get shot cards, and the run exits 1.
 
 ### detail
 

@@ -357,8 +357,11 @@ def contact_sheet(video: Path, out: Path, start: float, end: float, fps: float, 
     shutil.rmtree(frames_dir, ignore_errors=True)
     frames_dir.mkdir(parents=True)
     span = max(end - start, 1 / fps)
+    # A range shorter than one sampling interval (a one-frame DJI recording, say) gets no frame from
+    # the fps filter, so take its first frame instead.
+    sampling = ['-vf', f'fps={fps}'] if (end - start) * fps >= 1 else ['-frames:v', '1']
     run(['ffmpeg', '-v', 'error', '-y', '-ss', fmt_seconds(start), '-t', fmt_seconds(span), '-i', str(video),
-         '-vf', f'fps={fps}', '-q:v', '3', str(frames_dir / '%05d.jpg')], timeout=1800)
+         *sampling, '-q:v', '3', str(frames_dir / '%05d.jpg')], timeout=1800)
     frames = sorted(frames_dir.glob('*.jpg'))
     if not frames:
         shutil.rmtree(frames_dir, ignore_errors=True)
@@ -484,11 +487,16 @@ def cmd_index(a) -> int:
         return 2
     hashes = known_hashes(dest)
     print(f'indexing {len(clips)} clips into {index_dir} ({a.workers} workers)', flush=True)
-    metas = []
+    metas, failed = [], []
     with concurrent.futures.ThreadPoolExecutor(max_workers=a.workers) as pool:
         futures = {pool.submit(index_one, c, index_dir, hashes.get(str(c)), a.sheet_fps, a.force): c for c in clips}
         for fut in concurrent.futures.as_completed(futures):
-            m = fut.result()
+            try:
+                m = fut.result()
+            except Exception as e:  # one unreadable clip must not cost the rest of the batch its shot cards
+                failed.append({'clip': futures[fut].stem, 'source': str(futures[fut]), 'error': str(e)[-600:]})
+                print(f"  {futures[fut].stem}: FAILED {str(e).splitlines()[0][:200]}", flush=True)
+                continue
             metas.append(m)
             tag = 'cached' if m['cached'] else f"{m['timings_seconds']['total']}s"
             print(f"  {m['clip']}: {fmt_seconds(m['duration_seconds'])}s {m['width']}x{m['height']} {m['fps']} fps ({tag})", flush=True)
@@ -502,9 +510,12 @@ def cmd_index(a) -> int:
         'index_version': INDEX_VERSION, 'clips': [{k: v for k, v in m.items() if k != 'probe'} for m in metas],
         'shot_cards': str(cards), 'wall_seconds': wall,
         'machine_seconds': round(sum(m['timings_seconds']['total'] for m in metas if not m['cached']), 1),
-        'cached_clips': sum(1 for m in metas if m['cached'])})
+        'cached_clips': sum(1 for m in metas if m['cached']), 'failed': failed})
     print(f'{len(metas)} clips indexed in {wall}s; shot cards: {cards}'
           + (f' ({todo} rows still need in/out)' if todo else ''))
+    if failed:
+        print(f"{len(failed)} clip(s) failed and have no shot card: {', '.join(f['clip'] for f in failed)} (see index.json)", file=sys.stderr)
+        return 1
     return 0
 
 

@@ -1,0 +1,73 @@
+{
+  "source_path": "/Volumes/photo/630/2026-dump/video/example/C0001.MP4",
+  "clip_id": "C0001",
+  "channel": "left",
+  "model": "mlx-community/whisper-large-v3-turbo@a4aaeec",
+  "note": "Machine transcript of one recorded channel. Check by ear before quoting; speakers are not identified.",
+  "segments": [
+    {
+      "start": 0.0,
+      "end": 2.0,
+      "text": "over here",
+      "doubtful": false,
+      "avg_logprob": -0.5,
+      "no_speech_prob": 0.0
+    },
+    {
+      "start": 2.0,
+      "end": 4.0,
+      "text": "go go go go go go go go",
+      "doubtful": true,
+      "avg_logprob": -0.2,
+      "no_speech_prob": 0.0
+    },
+    {
+      "start": 30.02,
+      "end": 51.54,
+      "text": "what was that",
+      "doubtful": false,
+      "avg_logprob": -0.498,
+      "no_speech_prob": 0.0
+    },
+    {
+      "start": 90.02,
+      "end": 111.76,
+      "text": "the box is here",
+      "doubtful": false,
+      "avg_logprob": -0.439,
+      "no_speech_prob": 0.0
+    },
+    {
+      "start": 112.76,
+      "end": 113.24,
+      "text": "Hmm?",
+      "doubtful": false,
+      "avg_logprob": -0.439,
+      "no_speech_prob": 0.0
+    },
+    {
+      "start": 151.02,
+      "end": 153.02,
+      "text": "!",
+      "doubtful": false,
+      "avg_logprob": NaN,
+      "no_speech_prob": 0.0
+    },
+    {
+      "start": 179.56,
+      "end": 209.54,
+      "text": "Thank you.",
+      "doubtful": false,
+      "avg_logprob": -0.287,
+      "no_speech_prob": 0.0
+    },
+    {
+      "start": 215.0,
+      "end": 217.3,
+      "text": "last call",
+      "doubtful": false,
+      "avg_logprob": -0.4,
+      "no_speech_prob": 0.0
+    }
+  ]
+}

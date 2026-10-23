@@ -1,0 +1,37 @@
+{
+  "source_path": "/Volumes/photo/630/2026-dump/video/example/C0002.MP4",
+  "source_seconds": 5.0,
+  "clip_id": "C0002",
+  "channel": "right",
+  "model": "mlx-community/whisper-large-v3-turbo@a4aaeec",
+  "note": "Machine transcript of one recorded channel. Check by ear before quoting; speakers are not identified.",
+  "segments": [
+    {
+      "start": 0.0,
+      "end": 1.5,
+      "text": "good",
+      "doubtful": false,
+      "avg_logprob": -0.3,
+      "no_speech_prob": 0.0,
+      "compression_ratio": 0.5
+    },
+    {
+      "start": 1.5,
+      "end": 3.0,
+      "text": "go go go go go go",
+      "doubtful": false,
+      "avg_logprob": -0.2,
+      "no_speech_prob": 0.0,
+      "compression_ratio": 2.9
+    },
+    {
+      "start": 3.0,
+      "end": 6.0,
+      "text": "one more",
+      "doubtful": false,
+      "avg_logprob": -0.3,
+      "no_speech_prob": 0.0,
+      "compression_ratio": 0.9
+    }
+  ]
+}

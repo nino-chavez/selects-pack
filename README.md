@@ -28,6 +28,10 @@ live in 630-marketing-automation, `docs/internal/ops/RAW-FOOTAGE-WORKFLOW-PROPOS
 - Python 3.10 or newer with Pillow (`python3 -c "import PIL"` must pass).
 - `ffmpeg` and `ffprobe` on PATH (`brew install ffmpeg`).
 - No install step. Run `selects-pack` by path, or symlink it into `~/.local/bin`.
+- `transcribe` only: Apple silicon, mlx-whisper through uv, and the pinned model snapshot in the
+  Hugging Face cache. selects-pack does not install mlx-whisper, and no other command needs it.
+- Tests: `python3 -m unittest discover -s tests` from the repo root. They need neither the
+  model nor ffmpeg.
 
 ## Commands
 
@@ -192,6 +196,67 @@ was installed by copying the folder in and adding one entry to `root_meta_info.j
 a timestamped backup. CapCut listed it with the right duration. The agent's click to open it
 was refused by its permission classifier; Nino opened it by hand on 2026-10-18 and confirmed
 the clips were on the timeline.
+
+### transcribe
+
+    uv run --with mlx-whisper selects-pack transcribe <input>... --out DIR [--force]
+    selects-pack transcribe --out DIR --refilter
+
+One machine transcript per recorded audio channel, with the segments Whisper probably
+invented marked as doubtful. Two channels can carry two people, and a mixed transcript hides
+which mic carried a line. Reading the mixed sound once put the wrong speaker under a caption
+(2026-10-20).
+
+- mlx-whisper is needed to transcribe, not to refilter. Without it the command stops and
+  prints the `uv run --with mlx-whisper` line to use.
+- `<input>`: clip files, a directory of videos, or a batch review folder, as for `index`.
+- Each channel is pulled out as mono 16 kHz audio (`pan=mono|c0=c<N>`). It is transcribed by
+  `mlx-community/whisper-large-v3-turbo` at snapshot `a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb`,
+  with `language='en'` and `condition_on_previous_text=False`. A missing snapshot stops the run
+  and prints the download command.
+- `--out`: writes `<clip-id>_left.json` and `.txt`, plus `_right` for a two-channel clip. A
+  mono clip gets `_left` only; a clip with no audio gets nothing.
+- The clip id is the part of the file stem after the last `__`, so
+  `..._serve-line__C2959.mp4` gives `C2959`. Two inputs with one id stop the run.
+- A transcript already in `--out` under that id but made from another source also stops the
+  run, with or without `--force`. Sony numbering restarts on a formatted card, so a later
+  batch can bring a different `C0001`. Use another `--out`, or delete the old transcript.
+- So does one that cannot name its source: an unreadable JSON, or a relative `source_path`,
+  which the drive script stored when given a relative clip path. Refilter will not measure a
+  relative source either; that transcript is named as failed.
+- The JSON keeps every segment, marks the doubtful ones `"doubtful": true`, and records the
+  source duration. The `.txt` holds the other segments, one `m:ss.ss-m:ss.ss  text` line each.
+- A segment is doubtful when any of these hold:
+  - `no_speech_prob` over 0.6, or `compression_ratio` over 2.4: Whisper's own silence and
+    loop signals.
+  - `avg_logprob` under -1.0.
+  - More than 30% of its letters are outside a–z. Over gym noise, Whisper invents short
+    foreign words in an English-only recording.
+  - It is stretched: it ends more than 0.5 s past the end of the audio, or it lasts 10 s or
+    more at under 0.15 words per second ("Thank you." across 30 s).
+- `--force`: transcribe a clip again even though its JSON exists. Without it the clip is
+  skipped, so a stopped run can be rerun.
+- `--refilter`: re-applies the rules to every transcript in `--out` without calling Whisper.
+  Use it after a rule changes. Rerunning Whisper is no fix: its fallback sampling gives
+  different text on every run.
+- Refilter adds marks and never clears one, because older transcripts lack
+  `compression_ratio`. A transcript without a recorded duration has its source measured
+  again, so that source must be mounted.
+- A clip that fails, or a transcript that refilter cannot read, is named and the rest still
+  run; the run then exits 1.
+- A transcript is a machine reading of one mic. Speakers are not identified; check a line by
+  ear before quoting it.
+
+Measured 2026-10-23 on the 2026-10-22 practice-and-office transcripts (38 clips, 76
+transcripts). The rules came from those clips: they kept a four-word line spread over 21.7 s
+that both mics agreed on, and dropped the invented lines.
+
+- `--refilter` on a copy of all 76 reproduced the drive's files byte for byte.
+- A fresh `transcribe` of C3026 matched the drive's `.txt` on both channels, and so did
+  C3042's right channel. C3042's left channel came back with different wording, as the
+  fallback sampling predicts.
+- That rerun also produced a two-word line across 12 s that the first run did not have. At
+  0.17 words per second the rules keep it, which is why kept lines still get checked by ear.
 
 ## shot-cards.csv
 

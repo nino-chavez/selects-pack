@@ -9,6 +9,7 @@ Subcommands, the first four lifted from the TPS opening-weekend campaign scripts
   pack    one pre-trimmed clip per shot-card row, identity overlays, originals.txt, ORDER.txt
   edl     read a CapCut draft (an accepted cut) into an edit decision list JSON
   draft   (spike) stage a new CapCut project from a selects pack
+  transcribe  one Whisper transcript per mic channel, doubtful segments marked (needs mlx-whisper)
 
 The cut stays with the editor. This tool ends at a folder that can be dragged into CapCut.
 """
@@ -24,6 +25,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from collections import Counter
 from datetime import date, datetime
@@ -1068,6 +1070,192 @@ def cmd_draft(a) -> int:
     print(json.dumps({**info, 'staged': str(fold), 'leaked_template_ids': len(leaked)}, indent=2))
     return 0 if not leaked else 1
 
+# ---------------------------------------------------------------- transcribe
+
+# The 630 audio library's model, pinned to the snapshot the doubtful rules were tested on (2026-10-22).
+WHISPER_REPO = 'mlx-community/whisper-large-v3-turbo'
+WHISPER_REVISION = 'a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb'
+WHISPER_SNAPSHOT = (Path.home() / '.cache/huggingface/hub/models--mlx-community--whisper-large-v3-turbo/snapshots'
+                    / WHISPER_REVISION)
+TRANSCRIPT_CHANNELS = ['left', 'right']
+TRANSCRIPT_NOTE = 'Machine transcript of one recorded channel. Check by ear before quoting; speakers are not identified.'
+
+
+def transcript_id(clip: Path) -> str:
+    """The camera id. Campaign copies carry it after the last '__' (..._passing-line__C2959.mp4)."""
+    return clip.stem.split('__')[-1]
+
+
+def non_latin(text: str) -> bool:
+    letters = [c for c in text if c.isalpha()]
+    return bool(letters) and sum(1 for c in letters if not ('a' <= c.lower() <= 'z')) / len(letters) > 0.3
+
+
+def whisper_doubtful(seg: dict) -> bool:
+    """Whisper's own silence and loop signals, low confidence, or a mostly non-Latin script, which in
+    an English-only recording over gym noise is invented text. A signal the segment does not carry
+    counts as passing: transcripts written before 2026-10-23 have no compression_ratio."""
+    return (seg.get('no_speech_prob', 0) > 0.6 or seg.get('compression_ratio', 0) > 2.4
+            or seg.get('avg_logprob', 0) < -1.0 or non_latin(seg['text']))
+
+
+def stretched(seg: dict, audio_seconds: float) -> bool:
+    """Whisper stretched the segment over a quiet window: it runs past the end of the audio, or it
+    is long with almost no words ("Thank you." across 30 s)."""
+    length = seg['end'] - seg['start']
+    return seg['end'] > audio_seconds + 0.5 or (length >= 10 and len(seg['text'].split()) / length < 0.15)
+
+
+def whisper_segments(result: dict) -> list[dict]:
+    """mlx-whisper segments in the transcript shape. The signals are judged before rounding."""
+    segs = []
+    for s in result.get('segments', []):
+        text = s['text'].strip()
+        segs.append({'start': round(s['start'], 2), 'end': round(s['end'], 2), 'text': text,
+                     'doubtful': whisper_doubtful({**s, 'text': text}),
+                     'avg_logprob': round(s.get('avg_logprob', 0), 3), 'no_speech_prob': round(s.get('no_speech_prob', 0), 3),
+                     'compression_ratio': round(s.get('compression_ratio', 0), 3)})
+    return segs
+
+
+def transcript_stamp(x: float) -> str:
+    m, s = divmod(max(0.0, x), 60)
+    return f'{int(m)}:{s:05.2f}'
+
+
+def write_transcript(target: Path, record: dict, audio_seconds: float) -> int:
+    """Marks every segment the rules doubt (a mark is never cleared), then writes the .txt without
+    them and the JSON with them. The JSON goes last because its presence is what a rerun skips on."""
+    for s in record['segments']:
+        s['doubtful'] = s['doubtful'] or whisper_doubtful(s) or stretched(s, audio_seconds)
+    txt = ''.join(f"{transcript_stamp(s['start'])}-{transcript_stamp(s['end'])}  {s['text']}\n"
+                  for s in record['segments'] if not s['doubtful'] and s['text'])
+    # ensure_ascii=False: the invented foreign words are the text a person checks, so keep them readable.
+    for path, text in ((target.with_suffix('.txt'), txt), (target, json.dumps(record, indent=2, ensure_ascii=False) + '\n')):
+        tmp = path.with_suffix(path.suffix + '.tmp')
+        tmp.write_text(text)
+        os.replace(tmp, path)
+    return sum(1 for s in record['segments'] if not s['doubtful'])
+
+
+def refilter_transcripts(out: Path) -> int:
+    """Re-applies the doubtful rules to the transcripts in out without Whisper, whose fallback
+    sampling gives different text on every rerun."""
+    failed = 0
+    for target in sorted(p for name in TRANSCRIPT_CHANNELS for p in out.glob(f'*_{name}.json')):
+        try:
+            record = json.loads(target.read_text())
+            seconds = record.get('source_seconds')
+            if seconds is None:  # written before source_seconds was recorded: measure the source again
+                source = Path(record['source_path'])
+                if not source.is_absolute():  # it would resolve against today's folder, maybe to another clip
+                    raise ValueError(f'source path {source} is relative, so its duration cannot be measured')
+                seconds = float(probe(source)['format']['duration'])
+            kept = write_transcript(target, record, seconds)
+        except Exception as e:  # one unreadable transcript or unmounted source must not stop the rest
+            message = str(e) or type(e).__name__
+            print(f'{target.stem}: FAILED {type(e).__name__}: {message.splitlines()[0][:200]}', file=sys.stderr)
+            failed += 1
+            continue
+        print(f'{target.stem}: {kept} segments', flush=True)
+    return 1 if failed else 0
+
+
+def transcribed_from(target: Path) -> Path | None:
+    """The source an existing transcript was made from, or None when it cannot say: the JSON is
+    unreadable, or it holds a relative path from an unknown working folder."""
+    try:
+        source = Path(json.loads(target.read_text())['source_path'])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return source if source.is_absolute() else None
+
+
+def cmd_transcribe(a) -> int:
+    out = Path(a.out).expanduser()
+    if a.refilter:
+        if a.input:
+            print('--refilter re-applies the rules to every transcript in --out; name no clips', file=sys.stderr)
+            return 2
+        if not out.is_dir():
+            print(f'no transcript folder at {out}', file=sys.stderr)
+            return 2
+        return refilter_transcripts(out)
+    if not a.input:
+        print('name the clips to transcribe, or pass --refilter', file=sys.stderr)
+        return 2
+    try:
+        import mlx_whisper  # optional: only this subcommand needs it, and only on Apple silicon
+    except ImportError:
+        print('transcribe needs mlx-whisper, which selects-pack does not install. Run it as\n'
+              f'  uv run --with mlx-whisper {sys.argv[0]} transcribe ...', file=sys.stderr)
+        return 2
+    if not WHISPER_SNAPSHOT.is_dir():
+        print(f'the pinned Whisper snapshot is missing: {WHISPER_SNAPSHOT}\nFetch it with\n'
+              f'  uvx --from huggingface_hub hf download {WHISPER_REPO} --revision {WHISPER_REVISION}', file=sys.stderr)
+        return 2
+    clips = resolve_clips(a.input, None)
+    if not clips:
+        print('no clips found', file=sys.stderr)
+        return 2
+    ids = Counter(transcript_id(c) for c in clips)
+    dupes = sorted(k for k, n in ids.items() if n > 1)
+    if dupes:
+        print('two clips share a camera id, so they would share a transcript: ' + ', '.join(dupes), file=sys.stderr)
+        return 2
+    # Sony numbering restarts on a formatted card, so a later batch can bring a different C0001
+    # into the same --out. Skipping it, or forcing over it, would put one clip's words under another.
+    taken = []
+    for clip in clips:
+        for name in TRANSCRIPT_CHANNELS:
+            target = out / f'{transcript_id(clip)}_{name}.json'
+            if not target.exists():
+                continue
+            source = transcribed_from(target)
+            if source is None:
+                taken.append(f'{target.name} does not record a readable absolute source path, so it may be another clip\'s')
+            elif source.resolve() != clip.resolve():
+                taken.append(f'{target.name} is from {source}, not {clip}')
+    if taken:
+        print('transcripts already in --out may belong to another clip with the same camera id:\n  ' + '\n  '.join(taken)
+              + '\nWrite to another --out, or delete those transcripts to transcribe these clips.', file=sys.stderr)
+        return 2
+    out.mkdir(parents=True, exist_ok=True)
+    failed = []
+    for clip in clips:
+        cid = transcript_id(clip)
+        try:
+            pr = probe(clip)
+            audio = next((s for s in pr['streams'] if s['codec_type'] == 'audio'), None)
+            channels = int((audio or {}).get('channels', 0))
+            if not channels:
+                print(f'{cid}: no audio stream', flush=True)
+                continue
+            seconds = float(pr['format']['duration'])
+            # One transcript per channel: two channels can carry two people, and a mixed transcript
+            # hides which mic carried a line. A mono clip gets only _left.
+            for ch, name in list(enumerate(TRANSCRIPT_CHANNELS))[:channels]:
+                target = out / f'{cid}_{name}.json'
+                if target.exists() and not a.force:
+                    continue
+                with tempfile.TemporaryDirectory() as tmp:
+                    wav = Path(tmp) / 'channel.wav'
+                    run(['ffmpeg', '-v', 'error', '-i', str(clip), '-af', f'pan=mono|c0=c{ch}', '-ar', '16000', str(wav)])
+                    result = mlx_whisper.transcribe(str(wav), path_or_hf_repo=str(WHISPER_SNAPSHOT), language='en',
+                                                    condition_on_previous_text=False)
+                record = {'source_path': str(clip.absolute()), 'source_seconds': seconds, 'clip_id': cid, 'channel': name,
+                          'model': f'{WHISPER_REPO}@{WHISPER_REVISION[:7]}', 'note': TRANSCRIPT_NOTE,
+                          'segments': whisper_segments(result)}
+                print(f'{cid} {name}: {write_transcript(target, record, seconds)} segments', flush=True)
+        except Exception as e:  # one unreadable clip must not stop the batch; a rerun skips the finished ones
+            message = str(e) or type(e).__name__
+            failed.append(cid)
+            print(f'{cid}: FAILED {message.splitlines()[0][:200]}', flush=True)
+    if failed:
+        print(f"{len(failed)} clip(s) failed to transcribe: {', '.join(failed)}", file=sys.stderr)
+        return 1
+    return 0
+
 # ---------------------------------------------------------------- cli
 
 def main(argv=None) -> int:
@@ -1135,6 +1323,14 @@ def main(argv=None) -> int:
                    help='overlay stem to lay, in order, repeatable; a day label only when it is true of the footage '
                         '(default: the-point-series-light, 630-volleyball-light, the wordmark)')
     p.set_defaults(fn=cmd_draft)
+
+    p = sub.add_parser('transcribe', help='one Whisper transcript per audio channel, doubtful segments marked (needs mlx-whisper)')
+    p.add_argument('input', nargs='*', help='clip files, a directory of videos, or a batch review folder')
+    p.add_argument('--out', required=True, help='folder for <clip>_<left|right>.json and .txt')
+    p.add_argument('--force', action='store_true', help='transcribe clips that already have a transcript again')
+    p.add_argument('--refilter', action='store_true',
+                   help='re-apply the doubtful rules to every transcript in --out, without Whisper')
+    p.set_defaults(fn=cmd_transcribe)
 
     a = ap.parse_args(argv)
     if a.cmd == 'pack' and a.identity is None:

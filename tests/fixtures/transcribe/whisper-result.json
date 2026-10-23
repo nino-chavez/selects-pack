@@ -1,0 +1,16 @@
+{
+  "text": " over here Thank you. go go go go go go go go ありがとう nice pass",
+  "language": "en",
+  "segments": [
+    {"id": 0, "seek": 0, "start": 0.0, "end": 2.004, "text": " over here", "tokens": [], "temperature": 0.0,
+     "avg_logprob": -0.4321, "compression_ratio": 1.1, "no_speech_prob": 0.0012},
+    {"id": 1, "seek": 0, "start": 2.0, "end": 4.0, "text": " nice pass", "tokens": [], "temperature": 0.0,
+     "avg_logprob": -1.0004, "compression_ratio": 1.0, "no_speech_prob": 0.0},
+    {"id": 2, "seek": 0, "start": 4.0, "end": 6.0, "text": " go go go go go go go go", "tokens": [], "temperature": 0.0,
+     "avg_logprob": -0.2, "compression_ratio": 2.6, "no_speech_prob": 0.0},
+    {"id": 3, "seek": 0, "start": 6.0, "end": 7.0, "text": " ありがとう", "tokens": [], "temperature": 0.0,
+     "avg_logprob": -0.3, "compression_ratio": 0.8, "no_speech_prob": 0.0},
+    {"id": 4, "seek": 0, "start": 7.5, "end": 37.48, "text": " Thank you.", "tokens": [], "temperature": 0.0,
+     "avg_logprob": -0.6, "compression_ratio": 0.6, "no_speech_prob": 0.0}
+  ]
+}

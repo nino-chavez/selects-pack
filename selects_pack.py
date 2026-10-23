@@ -1473,10 +1473,14 @@ def catalog_files(event_dir: Path, library: Path, moves: list, notes_doc: dict, 
                                                              for d, m in reversed(built) if m['files'])]
     return out, summary
 
+def catalog_path(value: str) -> Path:
+    """Absolute, with any '..' taken out as text: a symlink in the path stays as typed."""
+    return Path(os.path.normpath(Path(value).absolute()))
+
 def cmd_catalog(a) -> int:
-    library = Path(a.library).absolute()
-    event_dir = Path(a.event_dir).absolute()
-    notes_path = Path(a.notes).absolute()
+    library = catalog_path(a.library)
+    event_dir = catalog_path(a.event_dir)
+    notes_path = catalog_path(a.notes)
     if not (library / 'CLIP-MANIFEST.json').is_file() or not (library / 'CLIP-INDEX.csv').is_file():
         print(f'{library} is not the clip library: no CLIP-MANIFEST.json and CLIP-INDEX.csv at its root', file=sys.stderr)
         return 2
@@ -1485,8 +1489,8 @@ def cmd_catalog(a) -> int:
         return 2
     notes_doc = json.loads(notes_path.read_text(encoding='utf-8'))
     moves = json.loads(Path(a.moves).read_text(encoding='utf-8'))
-    analysis = Path(a.analysis).absolute() if a.analysis else notes_path.parent
-    transcripts = Path(a.transcripts).absolute() if a.transcripts else analysis / 'transcripts'
+    analysis = catalog_path(a.analysis) if a.analysis else notes_path.parent
+    transcripts = catalog_path(a.transcripts) if a.transcripts else analysis / 'transcripts'
     dated = re.match(r'(\d{4}-\d{2}-\d{2})-(.+)', event_dir.name)
     event = a.event or notes_doc.get('event')
     event_date = a.event_date or (dated and dated.group(1))
@@ -1525,7 +1529,7 @@ def cmd_catalog(a) -> int:
     if not changed:
         print('nothing to write: every file already matches')
         return 0
-    backup = Path(a.backup).absolute() if a.backup else analysis / f'catalog-backup-{datetime.now():%Y%m%d-%H%M%S}'
+    backup = catalog_path(a.backup) if a.backup else analysis / f'catalog-backup-{datetime.now():%Y%m%d-%H%M%S}'
     if backup.exists():
         print(f'backup folder {backup} already exists; name a new one', file=sys.stderr)
         return 2

@@ -236,6 +236,9 @@ class Catalog(unittest.TestCase):
         code, _, err = self.lib.run('--transcripts', str(self.tmp))
         self.assertEqual(code, 2)
         self.assertIn('outside', err)
+        code, _, err = self.lib.run('--transcripts', str(self.lib.analysis / '../../../..'))  # inside only as typed
+        self.assertEqual(code, 2)
+        self.assertIn('outside', err)
 
     def test_an_existing_backup_folder_is_refused(self):
         (self.tmp / 'backup').mkdir()

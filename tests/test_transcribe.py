@@ -123,6 +123,13 @@ class Refilter(unittest.TestCase):
         self.assertEqual(out, 'C0002_right: 1 segments\n')
         self.assertEqual(self.flags('C0001_left.json'), [False, True, False, False, False, False, False, False])
 
+    def test_unreadable_transcript_fails_that_file_only(self):
+        (self.tmp / 'C0000_left.json').write_text('{"segments": [')
+        (code, out, err), _ = self.refilter(lambda path: probe_result(2, 216.7165))
+        self.assertEqual(code, 1)
+        self.assertIn('C0000_left: FAILED JSONDecodeError', err)
+        self.assertEqual(out, 'C0001_left: 4 segments\nC0002_right: 1 segments\n')
+
     def test_refilter_takes_no_clips(self):
         code, _, err = run_cli('clip.MP4', '--out', str(self.tmp), '--refilter')
         self.assertEqual(code, 2)
@@ -182,6 +189,27 @@ class Transcribe(unittest.TestCase):
         self.assertEqual((code, out, len(self.whisper_calls)), (0, '', 2))
         code, out, _ = self.transcribe(str(self.clip), '--out', str(self.out), '--force')
         self.assertEqual((code, len(self.whisper_calls)), (0, 4))
+
+    def test_a_transcript_from_another_clip_is_never_skipped_or_replaced(self):
+        self.transcribe(str(self.clip), '--out', str(self.out))
+        before = (self.out / 'C0001_left.json').read_bytes()
+        later = self.tmp / 'next-card' / 'C0001.MP4'  # a formatted card restarts the numbering
+        later.parent.mkdir()
+        later.write_bytes(b'')
+        for force in ([], ['--force']):
+            with self.subTest(force=force):
+                code, out, err = self.transcribe(str(later), '--out', str(self.out), *force)
+                self.assertEqual((code, out), (2, ''))
+                self.assertIn(f'C0001_left.json is from {self.clip}, not {later}', err)
+        self.assertEqual(len(self.whisper_calls), 2)
+        self.assertEqual((self.out / 'C0001_left.json').read_bytes(), before)
+
+    def test_the_same_clip_by_another_path_is_still_skipped(self):
+        self.transcribe(str(self.clip), '--out', str(self.out))
+        link = self.tmp / 'link'
+        link.symlink_to(self.tmp)
+        code, out, err = self.transcribe(str(link / self.clip.name), '--out', str(self.out))
+        self.assertEqual((code, out, len(self.whisper_calls)), (0, '', 2), err)
 
     def test_two_clips_with_one_camera_id_stop_the_run(self):
         other = self.tmp / 'C0001.MP4'

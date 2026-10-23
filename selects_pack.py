@@ -1143,18 +1143,27 @@ def refilter_transcripts(out: Path) -> int:
     sampling gives different text on every rerun."""
     failed = 0
     for target in sorted(p for name in TRANSCRIPT_CHANNELS for p in out.glob(f'*_{name}.json')):
-        record = json.loads(target.read_text())
-        seconds = record.get('source_seconds')
-        if seconds is None:  # written before source_seconds was recorded: measure the source again
-            try:
+        try:
+            record = json.loads(target.read_text())
+            seconds = record.get('source_seconds')
+            if seconds is None:  # written before source_seconds was recorded: measure the source again
                 seconds = float(probe(Path(record['source_path']))['format']['duration'])
-            except (subprocess.SubprocessError, KeyError, ValueError) as e:
-                print(f'{target.stem}: FAILED, cannot read the source duration of {record["source_path"]} ({type(e).__name__})',
-                      file=sys.stderr)
-                failed += 1
-                continue
-        print(f'{target.stem}: {write_transcript(target, record, seconds)} segments', flush=True)
+            kept = write_transcript(target, record, seconds)
+        except Exception as e:  # one unreadable transcript or unmounted source must not stop the rest
+            message = str(e) or type(e).__name__
+            print(f'{target.stem}: FAILED {type(e).__name__}: {message.splitlines()[0][:200]}', file=sys.stderr)
+            failed += 1
+            continue
+        print(f'{target.stem}: {kept} segments', flush=True)
     return 1 if failed else 0
+
+
+def transcribed_from(target: Path) -> Path | None:
+    """The source an existing transcript was made from, or None when it cannot be read."""
+    try:
+        return Path(json.loads(target.read_text())['source_path'])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
 
 
 def cmd_transcribe(a) -> int:
@@ -1189,6 +1198,19 @@ def cmd_transcribe(a) -> int:
     if dupes:
         print('two clips share a camera id, so they would share a transcript: ' + ', '.join(dupes), file=sys.stderr)
         return 2
+    # Sony numbering restarts on a formatted card, so a later batch can bring a different C0001
+    # into the same --out. Skipping it, or forcing over it, would put one clip's words under another.
+    taken = []
+    for clip in clips:
+        for name in TRANSCRIPT_CHANNELS:
+            target = out / f'{transcript_id(clip)}_{name}.json'
+            source = transcribed_from(target) if target.exists() else None
+            if source is not None and source.resolve() != clip.resolve():
+                taken.append(f'{target.name} is from {source}, not {clip}')
+    if taken:
+        print('a transcript with the same camera id already exists for another clip:\n  ' + '\n  '.join(taken)
+              + '\nWrite to another --out, or delete those transcripts to replace them.', file=sys.stderr)
+        return 2
     out.mkdir(parents=True, exist_ok=True)
     failed = []
     for clip in clips:
@@ -1212,7 +1234,7 @@ def cmd_transcribe(a) -> int:
                     run(['ffmpeg', '-v', 'error', '-i', str(clip), '-af', f'pan=mono|c0=c{ch}', '-ar', '16000', str(wav)])
                     result = mlx_whisper.transcribe(str(wav), path_or_hf_repo=str(WHISPER_SNAPSHOT), language='en',
                                                     condition_on_previous_text=False)
-                record = {'source_path': str(clip), 'source_seconds': seconds, 'clip_id': cid, 'channel': name,
+                record = {'source_path': str(clip.absolute()), 'source_seconds': seconds, 'clip_id': cid, 'channel': name,
                           'model': f'{WHISPER_REPO}@{WHISPER_REVISION[:7]}', 'note': TRANSCRIPT_NOTE,
                           'segments': whisper_segments(result)}
                 print(f'{cid} {name}: {write_transcript(target, record, seconds)} segments', flush=True)

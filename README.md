@@ -218,6 +218,9 @@ which mic carried a line. Reading the mixed sound once put the wrong speaker und
   mono clip gets `_left` only; a clip with no audio gets nothing.
 - The clip id is the part of the file stem after the last `__`, so
   `..._serve-line__C2959.mp4` gives `C2959`. Two inputs with one id stop the run.
+- A transcript already in `--out` under that id but made from another source also stops the
+  run, with or without `--force`. Sony numbering restarts on a formatted card, so a later
+  batch can bring a different `C0001`. Use another `--out`, or delete the old transcript.
 - The JSON keeps every segment, marks the doubtful ones `"doubtful": true`, and records the
   source duration. The `.txt` holds the other segments, one `m:ss.ss-m:ss.ss  text` line each.
 - A segment is doubtful when any of these hold:
@@ -236,7 +239,8 @@ which mic carried a line. Reading the mixed sound once put the wrong speaker und
 - Refilter adds marks and never clears one, because older transcripts lack
   `compression_ratio`. A transcript without a recorded duration has its source measured
   again, so that source must be mounted.
-- A clip that fails is named and the rest still run; the run then exits 1.
+- A clip that fails, or a transcript that refilter cannot read, is named and the rest still
+  run; the run then exits 1.
 - A transcript is a machine reading of one mic. Speakers are not identified; check a line by
   ear before quoting it.
 

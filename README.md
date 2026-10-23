@@ -221,6 +221,9 @@ which mic carried a line. Reading the mixed sound once put the wrong speaker und
 - A transcript already in `--out` under that id but made from another source also stops the
   run, with or without `--force`. Sony numbering restarts on a formatted card, so a later
   batch can bring a different `C0001`. Use another `--out`, or delete the old transcript.
+- So does one that cannot name its source: an unreadable JSON, or a relative `source_path`,
+  which the drive script stored when given a relative clip path. Refilter will not measure a
+  relative source either; that transcript is named as failed.
 - The JSON keeps every segment, marks the doubtful ones `"doubtful": true`, and records the
   source duration. The `.txt` holds the other segments, one `m:ss.ss-m:ss.ss  text` line each.
 - A segment is doubtful when any of these hold:

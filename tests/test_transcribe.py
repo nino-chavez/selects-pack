@@ -7,6 +7,7 @@ import contextlib
 import io
 import json
 import math
+import os
 import shutil
 import subprocess
 import sys
@@ -130,6 +131,16 @@ class Refilter(unittest.TestCase):
         self.assertIn('C0000_left: FAILED JSONDecodeError', err)
         self.assertEqual(out, 'C0001_left: 4 segments\nC0002_right: 1 segments\n')
 
+    def test_relative_source_is_not_measured(self):
+        record = json.loads((self.tmp / 'C0001_left.json').read_text())
+        record['source_path'] = 'C0001.MP4'
+        (self.tmp / 'C0001_left.json').write_text(json.dumps(record))
+        (code, out, err), probe = self.refilter(lambda path: probe_result(2, 216.7165))
+        self.assertEqual(code, 1)
+        self.assertIn('C0001_left: FAILED ValueError: source path C0001.MP4 is relative', err)
+        self.assertEqual(probe.call_count, 0)
+        self.assertEqual(out, 'C0002_right: 1 segments\n')
+
     def test_refilter_takes_no_clips(self):
         code, _, err = run_cli('clip.MP4', '--out', str(self.tmp), '--refilter')
         self.assertEqual(code, 2)
@@ -203,6 +214,24 @@ class Transcribe(unittest.TestCase):
                 self.assertIn(f'C0001_left.json is from {self.clip}, not {later}', err)
         self.assertEqual(len(self.whisper_calls), 2)
         self.assertEqual((self.out / 'C0001_left.json').read_bytes(), before)
+
+    def test_a_transcript_that_cannot_name_its_source_is_never_skipped_or_replaced(self):
+        # The drive script stored the clip path as typed, so a relative one resolves against
+        # whatever folder the next run starts in, possibly to another card's C0001.
+        self.out.mkdir()
+        here = os.getcwd()
+        os.chdir(self.tmp)  # where the relative path would resolve to this very clip
+        self.addCleanup(os.chdir, here)
+        for name, text in (('relative', '{"source_path": "' + self.clip.name + '", "segments": []}'),
+                           ('unreadable', '{"segments": [')):
+            (self.out / 'C0001_left.json').write_text(text)
+            for force in ([], ['--force']):
+                with self.subTest(name, force=force):
+                    code, out, err = self.transcribe(str(self.clip), '--out', str(self.out), *force)
+                    self.assertEqual((code, out), (2, ''))
+                    self.assertIn('C0001_left.json does not record a readable absolute source path', err)
+                    self.assertEqual((self.out / 'C0001_left.json').read_text(), text)
+        self.assertEqual(self.whisper_calls, [])
 
     def test_the_same_clip_by_another_path_is_still_skipped(self):
         self.transcribe(str(self.clip), '--out', str(self.out))

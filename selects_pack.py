@@ -1147,7 +1147,10 @@ def refilter_transcripts(out: Path) -> int:
             record = json.loads(target.read_text())
             seconds = record.get('source_seconds')
             if seconds is None:  # written before source_seconds was recorded: measure the source again
-                seconds = float(probe(Path(record['source_path']))['format']['duration'])
+                source = Path(record['source_path'])
+                if not source.is_absolute():  # it would resolve against today's folder, maybe to another clip
+                    raise ValueError(f'source path {source} is relative, so its duration cannot be measured')
+                seconds = float(probe(source)['format']['duration'])
             kept = write_transcript(target, record, seconds)
         except Exception as e:  # one unreadable transcript or unmounted source must not stop the rest
             message = str(e) or type(e).__name__
@@ -1159,11 +1162,13 @@ def refilter_transcripts(out: Path) -> int:
 
 
 def transcribed_from(target: Path) -> Path | None:
-    """The source an existing transcript was made from, or None when it cannot be read."""
+    """The source an existing transcript was made from, or None when it cannot say: the JSON is
+    unreadable, or it holds a relative path from an unknown working folder."""
     try:
-        return Path(json.loads(target.read_text())['source_path'])
+        source = Path(json.loads(target.read_text())['source_path'])
     except (OSError, ValueError, KeyError, TypeError):
         return None
+    return source if source.is_absolute() else None
 
 
 def cmd_transcribe(a) -> int:
@@ -1204,12 +1209,16 @@ def cmd_transcribe(a) -> int:
     for clip in clips:
         for name in TRANSCRIPT_CHANNELS:
             target = out / f'{transcript_id(clip)}_{name}.json'
-            source = transcribed_from(target) if target.exists() else None
-            if source is not None and source.resolve() != clip.resolve():
+            if not target.exists():
+                continue
+            source = transcribed_from(target)
+            if source is None:
+                taken.append(f'{target.name} does not record a readable absolute source path, so it may be another clip\'s')
+            elif source.resolve() != clip.resolve():
                 taken.append(f'{target.name} is from {source}, not {clip}')
     if taken:
-        print('a transcript with the same camera id already exists for another clip:\n  ' + '\n  '.join(taken)
-              + '\nWrite to another --out, or delete those transcripts to replace them.', file=sys.stderr)
+        print('transcripts already in --out may belong to another clip with the same camera id:\n  ' + '\n  '.join(taken)
+              + '\nWrite to another --out, or delete those transcripts to transcribe these clips.', file=sys.stderr)
         return 2
     out.mkdir(parents=True, exist_ok=True)
     failed = []

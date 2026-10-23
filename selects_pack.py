@@ -357,11 +357,21 @@ def contact_sheet(video: Path, out: Path, start: float, end: float, fps: float, 
     shutil.rmtree(frames_dir, ignore_errors=True)
     frames_dir.mkdir(parents=True)
     span = max(end - start, 1 / fps)
-    # A range shorter than one sampling interval (a one-frame DJI recording, say) gets no frame from
-    # the fps filter, so take its first frame instead.
-    sampling = ['-vf', f'fps={fps}'] if (end - start) * fps >= 1 else ['-frames:v', '1']
-    run(['ffmpeg', '-v', 'error', '-y', '-ss', fmt_seconds(start), '-t', fmt_seconds(span), '-i', str(video),
-         *sampling, '-q:v', '3', str(frames_dir / '%05d.jpg')], timeout=1800)
+    base = ['ffmpeg', '-v', 'error', '-y', '-ss', fmt_seconds(start), '-t', fmt_seconds(span), '-i', str(video)]
+    try:
+        try:
+            run([*base, '-vf', f'fps={fps}', '-q:v', '3', str(frames_dir / '%05d.jpg')], timeout=1800)
+        except RuntimeError:
+            if any(frames_dir.glob('*.jpg')):
+                raise  # failed partway through: a truncated sheet must not pass as complete
+            # sampled no frame at all; the first-frame attempt below decides
+        if not any(frames_dir.glob('*.jpg')):
+            # The fps filter yields nothing when the video stream is shorter than one sampling
+            # interval, whatever the container claims: DJI_0057 (2026-10-22) was one frame in a "1 s" file.
+            run([*base, '-frames:v', '1', '-q:v', '3', str(frames_dir / '%05d.jpg')], timeout=1800)
+    except RuntimeError:
+        shutil.rmtree(frames_dir, ignore_errors=True)
+        raise
     frames = sorted(frames_dir.glob('*.jpg'))
     if not frames:
         shutil.rmtree(frames_dir, ignore_errors=True)

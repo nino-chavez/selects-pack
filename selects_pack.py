@@ -361,7 +361,9 @@ def contact_sheet(video: Path, out: Path, start: float, end: float, fps: float, 
     try:
         run([*base, '-vf', f'fps={fps}', '-q:v', '3', str(frames_dir / '%05d.jpg')], timeout=1800)
     except RuntimeError:
-        pass  # sampled no frame; the first-frame attempt below decides
+        if any(frames_dir.glob('*.jpg')):
+            raise  # failed partway through: a truncated sheet must not pass as complete
+        # sampled no frame at all; the first-frame attempt below decides
     if not any(frames_dir.glob('*.jpg')):
         # The fps filter yields nothing when the video stream is shorter than one sampling interval,
         # whatever the container claims: DJI_0057 (2026-10-22) was one frame in a "1 s" file.

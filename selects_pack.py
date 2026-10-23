@@ -3,7 +3,7 @@
 
 Subcommands, the first four lifted from the TPS opening-weekend campaign scripts (2026-10-17):
 
-  ingest  copy-only ingest with sha256 verification into the /Volumes/photo/2026-dump layout
+  ingest  copy-only ingest with sha256 verification into the /Volumes/photo/630/2026-dump layout
   index   per clip: ffprobe metadata, a low-res proxy, a contact sheet, and shot-cards.csv
   detail  a finer contact sheet for one time range of one clip (the moment-finding aid)
   pack    one pre-trimmed clip per shot-card row, identity overlays, originals.txt, ORDER.txt
@@ -26,7 +26,7 @@ import subprocess
 import sys
 import time
 from collections import Counter
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 CHUNK = 8 * 1024 * 1024
@@ -180,9 +180,23 @@ def card_profile(root: Path) -> str:
     return 'other'
 
 
-def inventory(roots):
+def local_day(value: str) -> str:
+    """argparse type: a YYYY-MM-DD local date, returned unchanged once it parses."""
+    try:
+        datetime.strptime(value, '%Y-%m-%d')
+    except ValueError:
+        raise argparse.ArgumentTypeError(f'expected YYYY-MM-DD, got {value!r}') from None
+    return value
+
+
+def inventory(roots, since=None):
+    """Card files to ingest. With `since` (a local YYYY-MM-DD), only files modified on or after that
+    day: a card can still hold recordings that were imported earlier and later renamed into event
+    folders, which a full pass would copy again, or older material that is not part of this batch."""
+    cutoff = None if since is None else datetime.strptime(since, '%Y-%m-%d').timestamp()
     return [(root, p) for root in roots for p in root.rglob('*')
-            if p.is_file() and not any(s.startswith('.') for s in p.relative_to(root).parts)]
+            if p.is_file() and not any(s.startswith('.') for s in p.relative_to(root).parts)
+            and (cutoff is None or p.stat().st_mtime >= cutoff)]
 
 
 def cmd_ingest(a) -> int:
@@ -199,7 +213,7 @@ def cmd_ingest(a) -> int:
     profiles = {root: card_profile(root) for root in roots}
     previous = read_prior_manifests(dest, skip=manifest)
     review.mkdir(parents=True, exist_ok=True)
-    files = inventory(roots)
+    files = inventory(roots, a.since)
     required = sum(p.stat().st_size for _, p in files if prior_row(previous, p) is None)
     if shutil.disk_usage(dest).free < required + 1024 ** 3:
         print(f'Insufficient SSD free space: need {required:,} bytes plus 1 GiB headroom', file=sys.stderr)
@@ -223,7 +237,7 @@ def cmd_ingest(a) -> int:
 
     # Copy new media first, newest first, so previews need not wait on older recordings.
     files.sort(key=lambda rp: (prior_row(previous, rp[1]) is not None, -rp[1].stat().st_mtime))
-    report = {'date': a.date, 'batch': a.batch, 'sources': [str(r) for r in roots],
+    report = {'date': a.date, 'batch': a.batch, 'sources': [str(r) for r in roots], 'since': a.since,
               'card_profiles': {str(r): profiles[r] for r in roots},
               'destination': str(dest), 'state': 'copying',
               'source_policy': 'Copy only; no source edit/delete',
@@ -283,7 +297,7 @@ def cmd_ingest(a) -> int:
         write_json(manifest, report)
         print(f'{i}/{len(files)} {operation}: {src.name} ({before.st_size:,} bytes)', flush=True)
     initial = {str(src) for _, src in files}
-    final = {str(src) for _, src in inventory(roots)}
+    final = {str(src) for _, src in inventory(roots, a.since)}
     report['source_inventory_changed'] = sorted(initial ^ final)
     report['state'] = 'verified-complete' if initial == final else 'verified-snapshot-new-files-arrived'
     new_rows = [r for r in report['files'] if r['new_this_ingest']]
@@ -1032,17 +1046,19 @@ def main(argv=None) -> int:
 
     p = sub.add_parser('ingest', help='copy-only ingest of mounted cards with sha256 verification')
     p.add_argument('card', nargs='+', help='mounted card roots, e.g. /Volumes/Untitled')
-    p.add_argument('--dest', default='/Volumes/photo/2026-dump', help='SSD dump root (default /Volumes/photo/2026-dump)')
+    p.add_argument('--dest', default='/Volumes/photo/630/2026-dump', help='SSD dump root (default /Volumes/photo/630/2026-dump)')
     p.add_argument('--event', required=True, help='review folder slug, e.g. tps-opening-weekend-2026-10-17')
     p.add_argument('--batch', required=True, type=int, help='batch number within the event')
     p.add_argument('--date', default=date.today().isoformat(), help='ingest date for card-support paths (default today)')
+    p.add_argument('--since', type=local_day,
+                   help='only card files modified on or after this local date (YYYY-MM-DD); older files stay on the card and out of the manifest')
     p.set_defaults(fn=cmd_ingest)
 
     p = sub.add_parser('index', help='probe, proxy, contact sheet and shot-cards.csv for each clip')
     p.add_argument('input', nargs='+', help='batch review folder, a directory of videos, or clip files')
     p.add_argument('--out', required=True, help='work folder; writes index/ and shot-cards.csv there')
     p.add_argument('--selects', help='existing clip-selects.csv to seed shot-cards.csv (alternates parsed from the note)')
-    p.add_argument('--dest', default='/Volumes/photo/2026-dump', help='dump root whose manifests supply known hashes')
+    p.add_argument('--dest', default='/Volumes/photo/630/2026-dump', help='dump root whose manifests supply known hashes')
     p.add_argument('--sheet-fps', type=float, default=1.0, help='frames per second on the contact sheet (default 1)')
     p.add_argument('--workers', type=int, default=3)
     p.add_argument('--force', action='store_true', help='rebuild proxies and sheets even when cached')

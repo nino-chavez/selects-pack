@@ -8,7 +8,7 @@ the editor.
 T=~/Workspace/dev/tools/selects-pack/selects-pack
 
 $T ingest /Volumes/Untitled "/Volumes/Untitled 1" --event tps-opening-weekend-2026-10-17 --batch 4
-$T index  /Volumes/photo/2026-dump/review/tps-opening-weekend-2026-10-17/batch-4 --out ~/Workspace/create/campaigns/<campaign>/selects-pack
+$T index  /Volumes/photo/630/2026-dump/review/tps-opening-weekend-2026-10-17/batch-4 --out ~/Workspace/create/campaigns/<campaign>/selects-pack
 # look at <out>/index/<clip>/sheet.jpg, fill in/out in <out>/shot-cards.csv
 $T pack   ~/Workspace/create/campaigns/<campaign>/selects-pack --overlays <campaign>/generic-overlays --identity 630-volleyball
 ```
@@ -33,16 +33,20 @@ live in 630-marketing-automation, `docs/internal/ops/RAW-FOOTAGE-WORKFLOW-PROPOS
 
 ### ingest
 
-    selects-pack ingest <card>... --event <slug> --batch N [--dest DIR] [--date YYYY-MM-DD]
+    selects-pack ingest <card>... --event <slug> --batch N [--dest DIR] [--date YYYY-MM-DD] [--since YYYY-MM-DD]
 
 Copy-only ingest of mounted cards into the existing SSD layout, lifted from the TPS campaign's
 `ingest-sd-batch-3.py`. It never edits or deletes a card file.
 
 - `<card>`: one or more mounted roots. A missing root stops the run before any copy.
-- `--dest`: the dump root, default `/Volumes/photo/2026-dump`. Must already exist.
+- `--dest`: the dump root, default `/Volumes/photo/630/2026-dump`. Must already exist.
 - `--event`, `--batch`: the review folder, `<dest>/review/<event>/batch-<N>`, which receives
   `ingest-manifest.json`.
 - `--date`: the folder date for camera-support files, default today.
+- `--since`: only card files modified on or after this local date. Use it for a card that still
+  holds recordings imported earlier: those were renamed into event folders afterwards, so a full
+  pass would copy them again. Use it too for older material that is not part of this batch. Files
+  before the date stay on the card and out of the manifest; the manifest records the date.
 - Card type is detected per root: DJI (`DJI_*` files or `.LRF` proxies), Sony video
   (`PRIVATE/M4ROOT/CLIP`), Sony photo (`DCIM`).
 - Destinations: video to `video/` (DJI to `video/dji-osmo-pocket/`), `.LRF` to

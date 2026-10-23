@@ -10,6 +10,7 @@ Subcommands, the first four lifted from the TPS opening-weekend campaign scripts
   edl     read a CapCut draft (an accepted cut) into an edit decision list JSON
   draft   (spike) stage a new CapCut project from a selects pack
   transcribe  one Whisper transcript per mic channel, doubtful segments marked (needs mlx-whisper)
+  catalog  add an imported event folder to the clip library's manifests and index (dry run unless --write)
 
 The cut stays with the editor. This tool ends at a folder that can be dragged into CapCut.
 """
@@ -18,7 +19,9 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import csv
+import difflib
 import hashlib
+import io
 import json
 import os
 import re
@@ -30,6 +33,7 @@ import time
 from collections import Counter
 from datetime import date, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 CHUNK = 8 * 1024 * 1024
 INDEX_VERSION = 1
@@ -1256,6 +1260,294 @@ def cmd_transcribe(a) -> int:
         return 1
     return 0
 
+# ---------------------------------------------------------------- catalog
+
+LIBRARY = Path('/Volumes/photo/630')
+CATALOG_TZ = ZoneInfo('America/Chicago')
+DJI_DIR, PROXY_DIR = 'dji-osmo-pocket', 'proxies'
+CATALOG_PUBLICATION = 'Not determined by catalog; use owning campaign publication receipts.'
+CATALOG_NOTES = ['Camera IDs and hashes are retained. Search intent tags and context notes; a discovery range is not an approved edit.',
+                 'Source previews and machine transcripts are catalog evidence; audio wording and full motion need review before public use.',
+                 'Each mic channel has its own machine transcript; two channels can carry two different people.']
+
+def catalog_probe(path: Path) -> dict:
+    """The per-file metadata the library records (the 2026-10-20 catalog's fields and rounding)."""
+    j = probe(path)
+    v = next(s for s in j['streams'] if s['codec_type'] == 'video')
+    a = next((s for s in j['streams'] if s['codec_type'] == 'audio'), {})
+    rot = 0
+    for sd in v.get('side_data_list', []):
+        if 'rotation' in sd:
+            rot = int(sd['rotation'])
+    rot = rot or int(v.get('tags', {}).get('rotate', 0))
+    created = j['format'].get('tags', {}).get('creation_time')
+    chicago = None
+    if created:
+        chicago = datetime.fromisoformat(created.replace('Z', '+00:00')).astimezone(CATALOG_TZ).isoformat()
+    return {
+        'duration_seconds': round(float(j['format']['duration']), 4),
+        'encoded_width': v['width'], 'encoded_height': v['height'],
+        'rotation_degrees': abs(rot) % 360,
+        'frame_rate': v.get('avg_frame_rate'),
+        'video_codec': v.get('codec_name'), 'audio_codec': a.get('codec_name'),
+        'audio_channels': a.get('channels', 0),
+        'creation_time_metadata': created, 'creation_time_in_chicago': chicago,
+    }
+
+def catalog_slug(text: str) -> str:
+    return re.sub(r'-+', '-', re.sub(r'[^a-z0-9]+', '-', text.lower().replace('’', ''))).strip('-')
+
+def catalog_json(data) -> bytes:
+    return (json.dumps(data, indent=2, ensure_ascii=False) + '\n').encode('utf-8')
+
+def catalog_manifest(rel_dir: str, files: list, children: list, generated: str) -> dict:
+    recursive = len(files) + sum(c['recursive_video_files'] for c in children)
+    return {'schema_version': 1, 'generated_date': generated, 'directory': rel_dir,
+            'scope': 'direct videos, with child manifests for descendants',
+            'direct_video_files': len(files), 'recursive_video_files': recursive,
+            'children': children, 'files': files, 'notes': list(CATALOG_NOTES)}
+
+def catalog_child(directory: Path, m: dict) -> dict:
+    return {'directory': directory.name, 'manifest': f'{directory.name}/CLIP-MANIFEST.json',
+            'recursive_video_files': m['recursive_video_files']}
+
+def clips_md(m: dict, title: str) -> str:
+    lines = [f'# Clips — {title}', '',
+             f'{m["recursive_video_files"]} video file paths in this directory tree. See `CLIP-MANIFEST.json` for hashes, metadata and child directories.', '']
+    if m['files']:
+        lines += ['| File | Seconds | Role | Subject | Find it for |', '|---|---:|---|---|---|']
+        for f in sorted(m['files'], key=lambda f: f['filename']):
+            lines.append(f'| [{f["filename"]}]({f["filename"]}) | {f["duration_seconds"]:.2f} | {f["asset_role"]} | '
+                         f'{f["subject"].replace("|", "/")} | {", ".join(f["intent_tags"])} |')
+        lines.append('')
+    if m['children']:
+        lines += ['## Subdirectories', '']
+        for c in m['children']:
+            lines.append(f'- [{c["directory"]}]({c["directory"]}/CLIPS.md) — {c["recursive_video_files"]} video paths')
+        lines.append('')
+    return '\n'.join(lines)
+
+def catalog_files(event_dir: Path, library: Path, moves: list, notes_doc: dict, *, event: str, event_date: str,
+                  label: str, evidence: str, analysis: Path, transcripts: Path, generated: str, gone=()):
+    """Every file the catalog writes, as bytes, in write order; plus a summary. Reads only.
+
+    Lifted from the Oct 22 import's build_catalog.py, in the schema the Oct 20 catalog set. Hashes come
+    from the move log, whose values were read back against the ingest manifest when the files were
+    organized; bytes are measured again here. Subjects and notes come from the clip notes. The event
+    folder is cataloged whole: its earlier rows in the root manifest and the index are replaced."""
+    def rel(p: Path) -> str:
+        return str(Path(p).relative_to(library))
+
+    def ours(path_text: str) -> bool:
+        return path_text.startswith(rel(event_dir) + '/')
+
+    notes = notes_doc['notes']
+    hashes = {Path(m['to']): m['sha256'] for m in moves}
+    with (library / 'CLIP-INDEX.csv').open(newline='', encoding='utf-8') as fh:
+        reader = csv.DictReader(fh)
+        index_rows, cols = list(reader), reader.fieldnames
+
+    def videos(d: Path, suffixes) -> list[Path]:
+        return sorted(p for p in d.iterdir() if p.is_file() and not p.name.startswith('.')
+                      and p.suffix.upper() in suffixes) if d.is_dir() else []
+
+    levels = [(event_dir / DJI_DIR / PROXY_DIR, {'.LRF'}, 'camera-proxy'),
+              (event_dir / DJI_DIR, VIDEO_SUFFIXES, 'camera-original'),
+              (event_dir, VIDEO_SUFFIXES, 'camera-original')]
+    found = [(d, role, videos(d, suffixes)) for d, suffixes, role in levels if d.is_dir()]
+    paths = [p for _, _, ps in found for p in ps]
+    missing_notes = sorted({p.stem for p in paths} - set(notes))
+    if missing_notes:
+        raise SystemExit(f'the clip notes have no entry for {", ".join(missing_notes)}')
+    unhashed = [rel(p) for p in paths if p not in hashes]
+    if unhashed:
+        raise SystemExit(f'the move log has no sha256 for {", ".join(unhashed)}')
+    moved = {p for p in hashes if event_dir in p.parents and p.suffix.upper() in VIDEO_SUFFIXES | {'.LRF'}}
+    gone = {event_dir / g for g in gone}
+    wrong = sorted(str(g.relative_to(event_dir)) for g in gone if g not in moved or g.exists())
+    if wrong:
+        raise SystemExit(f'--gone names files the move log did not move here, or that are still here: {", ".join(wrong)}')
+    absent = sorted(rel(p) for p in moved - gone - set(paths) if not p.exists())
+    if absent:
+        raise SystemExit(f'moved here but no longer in the folder: {", ".join(absent)}. Restore them, or, if they '
+                         'were removed on purpose, name each with --gone <path inside the event folder>')
+    unread = sorted(rel(p) for p in moved - gone - set(paths))
+    if unread:
+        raise SystemExit(f'moved videos in folders this catalog does not read: {", ".join(unread)}')
+    # Copies already in the library, outside this event, so a rerun lists what the first run listed.
+    known: dict[str, list[str]] = {}
+    for r in index_rows:
+        if not ours(r['path']):
+            known.setdefault(r['sha256'], []).append(r['path'])
+
+    def entry(path: Path, role: str) -> dict:
+        cid = path.stem
+        n = notes[cid]
+        e = {'path': rel(path), 'filename': path.name, 'source_id': cid, 'asset_role': role,
+             'event': event, 'event_date': event_date, 'event_evidence': evidence}
+        if role == 'camera-original':
+            e.update(subject=n['subject'], intent_tags=n['intent_tags'], context_notes=n['notes'],
+                     review_scope=notes_doc['review_scope'])
+        else:
+            e.update(subject=f'Low-resolution camera proxy of {cid}', intent_tags=n['intent_tags'],
+                     context_notes=f'DJI on-camera proxy (.LRF) of {cid}: {n["subject"]}. Cut from the original.',
+                     review_scope='Not reviewed on its own; matched to its original by camera ID.')
+        e.update(catalog_probe(path))
+        e['bytes'] = path.stat().st_size
+        e['sha256'] = hashes[path]
+        e['identical_byte_copies'] = sorted(set(known.get(e['sha256'], [])) | {e['path']})
+        e['publication_status'] = CATALOG_PUBLICATION
+        e['suggested_descriptive_filename'] = f'{event_date}_{label}_{catalog_slug(n["subject"])}__{path.name}'
+        if role == 'camera-original':
+            t = {}
+            for ch in TRANSCRIPT_CHANNELS:
+                txt = transcripts / f'{cid}_{ch}.txt'
+                if txt.exists():
+                    t[ch] = {'txt': rel(txt), 'json': rel(txt.with_suffix('.json'))}
+            e['transcript'] = '; '.join(v['txt'] for v in t.values())
+            e['transcripts_by_channel'] = t
+            idx = analysis / 'index' / cid
+            e['contact_sheet'] = rel(idx / 'sheet.jpg') if (idx / 'sheet.jpg').exists() else None
+            e['preview'] = rel(idx / 'proxy.mp4') if (idx / 'proxy.mp4').exists() else None
+            e['candidate_ranges'] = []
+        e['camera_filename'] = path.name
+        return e
+
+    out: list[tuple[Path, bytes]] = []
+    built, below = [], []
+    for d, role, ps in found:  # deepest folder first, so each manifest can name its child
+        files = [entry(p, role) for p in ps]
+        m = catalog_manifest(rel(d), files, below, generated)
+        built.append((d, m))
+        below = [catalog_child(d, m)]
+    for d, m in built:
+        out.append((d / 'CLIP-MANIFEST.json', catalog_json(m)))
+        out.append((d / 'CLIPS.md', clips_md(m, str(d.relative_to(event_dir.parent))).encode('utf-8')))
+    new = [f for _, m in reversed(built) for f in m['files']]
+    event_m = built[-1][1]
+
+    # Parents up to the root: the event's own parent lists it as a child; the rest update a count.
+    name, count, d, counts = event_dir.name, event_m['recursive_video_files'], event_dir.parent, []
+    while d != library:
+        p = d / 'CLIP-MANIFEST.json'
+        m = json.loads(p.read_text(encoding='utf-8'))
+        if d == event_dir.parent:
+            m['children'] = [c for c in m['children'] if c['directory'] != name] + [catalog_child(event_dir, event_m)]
+        else:
+            hit = [c for c in m['children'] if c['directory'] == name]
+            if not hit:
+                raise SystemExit(f'{rel(p)} has no child entry for {name}')
+            for c in hit:
+                c['recursive_video_files'] = count
+        m['recursive_video_files'] = m['direct_video_files'] + sum(c['recursive_video_files'] for c in m['children'])
+        m['generated_date'] = generated
+        out.append((p, catalog_json(m)))
+        counts.append(f'{rel(d)} {m["recursive_video_files"]}')
+        name, count, d = d.name, m['recursive_video_files'], d.parent
+    # The root lists every file in the library, and counts them.
+    root_m = json.loads((library / 'CLIP-MANIFEST.json').read_text(encoding='utf-8'))
+    root_m['files'] = [f for f in root_m['files'] if not ours(f['path'])] + new
+    hit = [c for c in root_m['children'] if c['directory'] == name]
+    if not hit:
+        raise SystemExit(f'CLIP-MANIFEST.json at the root has no child entry for {name}')
+    for c in hit:
+        c['recursive_video_files'] = count
+    root_m['recursive_video_files'] = len(root_m['files'])
+    root_m['generated_date'] = generated
+    out.append((library / 'CLIP-MANIFEST.json', catalog_json(root_m)))
+
+    kept = [r for r in index_rows if not ours(r['path'])]
+    rows = kept + [{k: ('; '.join(f[k]) if k == 'intent_tags' else f.get(k, '')) for k in cols} for f in new]
+    buf = io.StringIO(newline='')
+    w = csv.DictWriter(buf, fieldnames=cols)
+    w.writeheader()
+    w.writerows(rows)
+    out.append((library / 'CLIP-INDEX.csv', buf.getvalue().encode('utf-8')))
+
+    dupes = [(f['path'], f['identical_byte_copies']) for f in new if len(f['identical_byte_copies']) > 1]
+    summary = [f'new video paths: {len(new)} (' + ', '.join(f'{rel(d)} {len(m["files"])}' for d, m in reversed(built)) + ')',
+               f'already in the library by hash: {len(dupes)}', *[f'  {p}: {c}' for p, c in dupes],
+               'recursive counts: ' + ', '.join(counts) + f', root {root_m["recursive_video_files"]}',
+               f'distinct sha256 in index: {len({r["sha256"] for r in rows})}; index rows {len(rows)}',
+               'first creation time per folder: ' + ', '.join(f'{d.name} {m["files"][0]["creation_time_metadata"]}'
+                                                             for d, m in reversed(built) if m['files'])]
+    return out, summary
+
+def catalog_path(value: str) -> Path:
+    """Absolute, with any '..' taken out as text: a symlink in the path stays as typed."""
+    return Path(os.path.normpath(Path(value).absolute()))
+
+def cmd_catalog(a) -> int:
+    library = catalog_path(a.library)
+    event_dir = catalog_path(a.event_dir)
+    notes_path = catalog_path(a.notes)
+    if not (library / 'CLIP-MANIFEST.json').is_file() or not (library / 'CLIP-INDEX.csv').is_file():
+        print(f'{library} is not the clip library: no CLIP-MANIFEST.json and CLIP-INDEX.csv at its root', file=sys.stderr)
+        return 2
+    if not event_dir.is_dir() or library not in event_dir.parents or event_dir.parent == library:
+        print(f'{event_dir} must be a folder at least two levels inside {library}', file=sys.stderr)
+        return 2
+    notes_doc = json.loads(notes_path.read_text(encoding='utf-8'))
+    moves = json.loads(Path(a.moves).read_text(encoding='utf-8'))
+    analysis = catalog_path(a.analysis) if a.analysis else notes_path.parent
+    transcripts = catalog_path(a.transcripts) if a.transcripts else analysis / 'transcripts'
+    dated = re.match(r'(\d{4}-\d{2}-\d{2})-(.+)', event_dir.name)
+    event = a.event or notes_doc.get('event')
+    event_date = a.event_date or (dated and dated.group(1))
+    label = a.label or (dated and dated.group(2))
+    evidence = a.evidence or notes_doc.get('event_evidence')
+    lacking = [flag for flag, value in (('--event', event), ('--event-date', event_date), ('--label', label),
+                                        ('--evidence', evidence)) if not value]
+    if lacking:
+        print(f'name {", ".join(lacking)}: the folder name or the clip notes do not give it', file=sys.stderr)
+        return 2
+    for name, folder in (('--analysis', analysis), ('--transcripts', transcripts)):
+        if library not in folder.parents:
+            print(f'{name} {folder} is outside {library}; the catalog stores library-relative paths', file=sys.stderr)
+            return 2
+    out, summary = catalog_files(event_dir, library, moves, notes_doc, event=event, event_date=event_date, label=label,
+                                 evidence=evidence, analysis=analysis, transcripts=transcripts,
+                                 generated=a.generated_date or date.today().isoformat(), gone=a.gone or [])
+    print('\n'.join(summary))
+    changed = []
+    for path, data in out:
+        if not path.exists():
+            state = 'new'
+        elif path.read_bytes() == data:
+            state = 'identical'
+        else:
+            old = path.read_text(encoding='utf-8').splitlines()
+            diff = [x for x in difflib.unified_diff(old, data.decode('utf-8').splitlines(), lineterm='', n=0)
+                    if x[:1] in '+-' and x[:3] not in ('+++', '---')]
+            state = f'differs ({len(diff)} lines)'
+        if state != 'identical':
+            changed.append((path, data))
+        print(f'{state:>22}  {path.relative_to(library)}')
+    if not a.write:
+        print(f'dry run: nothing written; {len(changed)} of {len(out)} files would change. Pass --write to back up and write them.')
+        return 0
+    if not changed:
+        print('nothing to write: every file already matches')
+        return 0
+    backup = catalog_path(a.backup) if a.backup else analysis / f'catalog-backup-{datetime.now():%Y%m%d-%H%M%S}'
+    if backup.exists():
+        print(f'backup folder {backup} already exists; name a new one', file=sys.stderr)
+        return 2
+    for path, _ in changed:  # every file it replaces is copied and read back before the first write
+        if path.exists():
+            saved = backup / path.relative_to(library)
+            saved.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, saved)
+            if digest(saved) != digest(path):
+                print(f'backup of {path} did not read back; nothing written', file=sys.stderr)
+                return 1
+    for path, data in changed:
+        tmp = path.with_name(path.name + '.tmp')
+        tmp.write_bytes(data)
+        os.replace(tmp, path)
+    print(f'wrote {len(changed)} files; the files they replaced are in {backup}')
+    return 0
+
 # ---------------------------------------------------------------- cli
 
 def main(argv=None) -> int:
@@ -1331,6 +1623,24 @@ def main(argv=None) -> int:
     p.add_argument('--refilter', action='store_true',
                    help='re-apply the doubtful rules to every transcript in --out, without Whisper')
     p.set_defaults(fn=cmd_transcribe)
+
+    p = sub.add_parser('catalog', help='add an imported event folder to the clip library (dry run unless --write)')
+    p.add_argument('event_dir', help='the event folder inside the library, e.g. <library>/2026-dump/video/2026-10-22-practice-and-office')
+    p.add_argument('--moves', required=True, help='move log: JSON list of {from, to, sha256}, one per file moved into the event folder')
+    p.add_argument('--notes', required=True, help='clip notes JSON: review_scope, and notes{<clip>: {subject, intent_tags, notes}}')
+    p.add_argument('--evidence', help="event_evidence text for every file (default: the notes file's event_evidence)")
+    p.add_argument('--event', help="event slug (default: the notes file's event)")
+    p.add_argument('--event-date', type=local_day, help='default: the date that starts the folder name')
+    p.add_argument('--label', help='event label in suggested filenames (default: the folder name after its date)')
+    p.add_argument('--library', default=str(LIBRARY), help=f'clip library root (default {LIBRARY})')
+    p.add_argument('--analysis', help="selects-pack work folder holding index/<clip>/ (default: the notes file's folder)")
+    p.add_argument('--transcripts', help='folder of <clip>_<left|right>.txt transcripts (default: <analysis>/transcripts)')
+    p.add_argument('--generated-date', type=local_day, help='generated_date for every manifest written (default: today)')
+    p.add_argument('--gone', action='append', help='a file the move log moved here that was removed on purpose, as a path '
+                   'inside the event folder (dji-osmo-pocket/DJI_0057.MP4); repeatable')
+    p.add_argument('--write', action='store_true', help='back up every file it replaces, then write them')
+    p.add_argument('--backup', help='backup folder, which must not exist yet (default: <analysis>/catalog-backup-<time>)')
+    p.set_defaults(fn=cmd_catalog)
 
     a = ap.parse_args(argv)
     if a.cmd == 'pack' and a.identity is None:

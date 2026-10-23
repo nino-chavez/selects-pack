@@ -258,6 +258,54 @@ that both mics agreed on, and dropped the invented lines.
 - That rerun also produced a two-word line across 12 s that the first run did not have. At
   0.17 words per second the rules keep it, which is why kept lines still get checked by ear.
 
+### catalog
+
+    selects-pack catalog <event-folder> --moves FILE --notes FILE [--evidence TEXT] [--gone PATH]... [--write]
+
+Adds an imported event folder to the clip library at `/Volumes/photo/630`. It writes a
+`CLIP-MANIFEST.json` and `CLIPS.md` per folder, links the folder from each parent manifest, and
+puts its files in the root `CLIP-MANIFEST.json` and `CLIP-INDEX.csv`. It never touches media.
+Without `--write` it only reports.
+
+- `<event-folder>`: where the originals were moved, such as
+  `2026-dump/video/2026-10-22-practice-and-office`. Its `dji-osmo-pocket/` and
+  `dji-osmo-pocket/proxies/` are cataloged too when they exist. It must sit at least two
+  levels inside the library.
+- `--moves`: the move log written when the originals were organized, a JSON list of
+  `{from, to, sha256}`. Hashes come from it; bytes are measured again.
+- `--notes`: clip notes JSON holding `review_scope` and `notes`, one
+  `{subject, intent_tags, notes}` per clip id. It may also carry `event` and `event_evidence`.
+- `--evidence`: the `event_evidence` text on every file, when the notes lack it.
+- `--event`, `--event-date`, `--label`: default to the notes' `event`, then to the date and the
+  rest of the folder name (`2026-10-22`, `practice-and-office`). The label goes into each
+  `suggested_descriptive_filename`.
+- `--analysis`: the `index` work folder whose `index/<clip>/sheet.jpg` and `proxy.mp4` are
+  linked, default the notes file's folder. `--transcripts` defaults to `<analysis>/transcripts`.
+  Both must sit inside the library, because the catalog stores library-relative paths.
+- `--generated-date`: the `generated_date` on every manifest written, default today.
+- `--library`: default `/Volumes/photo/630`.
+- The dry run builds every file in memory and prints `identical`, `differs` or `new` for each.
+- `--write` first copies every file it will replace into `--backup`, then reads each copy back
+  by SHA-256. The default is `<analysis>/catalog-backup-<time>`, and it must not exist yet.
+  Files that would not change are left alone.
+- A rerun replaces the event folder's earlier rows as a whole. `identical_byte_copies` lists
+  the same bytes elsewhere in the library but not within the event, so a rerun matches the
+  first run.
+- It stops before writing when a clip has no note or no hash in the move log. It also stops
+  when a moved video is missing or sits in a folder it does not read.
+- `--gone PATH`: a file the move log moved in that was removed on purpose, as a path inside
+  the event folder. Its rows leave the catalog. Repeatable.
+- `CLIP-LIBRARY.md` is not written. Add the event's dated section by hand.
+
+Lifted from the Oct 22 import's `build_catalog.py`, which held that event's paths in its code.
+Measured 2026-10-23 on that import:
+
+- On a mirror of the library with the real media linked in, all 10 files came out byte for byte
+  as the Oct 22 script wrote them. A changed `--generated-date` or `--label` made them differ.
+- `DJI_0057.MP4`, a one-frame clip, has left the SSD since then, and the catalog still lists it.
+  The mirror held a stand-in of its recorded size and probe fields. On the SSD the command stops
+  at that file until it is restored or named with `--gone`.
+
 ## shot-cards.csv
 
 The `clip-selects.csv` shape plus one column:

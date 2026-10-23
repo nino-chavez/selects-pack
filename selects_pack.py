@@ -435,7 +435,8 @@ def seed_shot_cards(path: Path, metas: list[dict], selects: Path | None, keep_ex
                     failed: frozenset[str] = frozenset()) -> int:
     """Write shot-cards.csv. Rows typed by hand survive: without --selects an existing file is
     merged by clip and only clips it lacks are appended. A selects row for a clip that failed to
-    index this run is carried through unchanged, so a rerun after the fix still has it."""
+    index this run is kept, its alternates parsed without a duration limit, so the row survives a
+    rerun without --selects."""
     by_clip = {m['clip']: m for m in metas}
     rows = []
     if selects is None and keep_existing and path.exists():
@@ -448,15 +449,15 @@ def seed_shot_cards(path: Path, metas: list[dict], selects: Path | None, keep_ex
         if unknown:
             raise SystemExit(f'selects name clips that are not indexed: {", ".join(unknown)}')
         for r in incoming:
-            if r['clip'] in failed:
-                print(f"warning: {r['clip']} failed to index; its selects row is kept unchanged", file=sys.stderr)
-                rows.append({k: r.get(k, '') for k in SHOT_CARD_FIELDS})
-                continue
-            m = by_clip[r['clip']]
+            m = by_clip.get(r['clip'])
+            if m is None:
+                print(f"warning: {r['clip']} failed to index; its selects row is kept, with alternates parsed "
+                      'without a duration limit', file=sys.stderr)
             primary = (float(r['candidate_in_seconds']), float(r['candidate_out_seconds'])) \
                 if r.get('candidate_in_seconds') not in (None, '') else None
             alternates = r.get('alternates') or ranges_field(
-                parse_ranges(r.get('editorial_note', ''), exclude=primary, limit=m['duration_seconds']))
+                parse_ranges(r.get('editorial_note', ''), exclude=primary,
+                             limit=m['duration_seconds'] if m else None))
             rows.append({'clip': r['clip'], 'observed_subject': r.get('observed_subject', ''),
                          'candidate_in_seconds': r.get('candidate_in_seconds', ''),
                          'candidate_out_seconds': r.get('candidate_out_seconds', ''),
@@ -521,7 +522,8 @@ def cmd_index(a) -> int:
     print(f'{len(metas)} clips indexed in {wall}s; shot cards: {cards}'
           + (f' ({todo} rows still need in/out)' if todo else ''))
     if failed:
-        print(f"{len(failed)} clip(s) failed and have no shot card: {', '.join(f['clip'] for f in failed)} (see index.json)", file=sys.stderr)
+        print(f"{len(failed)} clip(s) failed to index: {', '.join(f['clip'] for f in failed)} (see index.json). "
+              'Any shot-card row for them was kept, but pack needs them indexed.', file=sys.stderr)
         return 1
     return 0
 

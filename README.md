@@ -96,7 +96,7 @@ and one row in `<out>/shot-cards.csv`.
   frame on the sheet.
 - A clip that cannot be read does not stop the batch. It is listed under `failed` in
   `index/index.json`, the rest still get shot cards, and the run exits 1. With `--selects`, a
-  failed clip's row is carried into `shot-cards.csv` unchanged.
+  failed clip keeps its row in `shot-cards.csv`; `pack` still needs it indexed.
 
 ### detail
 

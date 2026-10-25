@@ -10,6 +10,7 @@ Subcommands, the first four lifted from the TPS opening-weekend campaign scripts
   edl     read a CapCut draft (an accepted cut) into an edit decision list JSON
   draft   (spike) stage a new CapCut project from a selects pack
   transcribe  one Whisper transcript per mic channel, doubtful segments marked (needs mlx-whisper)
+  analyze  index clips, retain channel-filled audio, transcribe, and build searchable batch indexes
   catalog  add an imported event folder to the clip library's manifests and index (dry run unless --write)
 
 The cut stays with the editor. This tool ends at a folder that can be dragged into CapCut.
@@ -20,6 +21,7 @@ import argparse
 import concurrent.futures
 import csv
 import difflib
+import fcntl
 import hashlib
 import io
 import json
@@ -423,8 +425,11 @@ def index_one(src: Path, out_dir: Path, sha: str | None, sheet_fps: float, force
     sha = sha or digest(src)
     if meta_path.exists() and not force:
         old = json.loads(meta_path.read_text())
+        artifacts = old.get('artifact_sha256', {})
         if old.get('sha256') == sha and old.get('index_version') == INDEX_VERSION \
-                and (d / 'proxy.mp4').exists() and (d / 'sheet.jpg').exists():
+                and old.get('requested_sheet_fps') == sheet_fps \
+                and all((d / name).is_file() and digest(d / name) == artifacts.get(name)
+                        for name in ('proxy.mp4', 'sheet.jpg')):
             old['cached'] = True
             return old
     pr = probe(src)
@@ -442,7 +447,8 @@ def index_one(src: Path, out_dir: Path, sha: str | None, sheet_fps: float, force
             **summary, 'proxy': f'{stem}/proxy.mp4', 'sheet': f'{stem}/sheet.jpg', 'sheet_sampling': sheet,
             'probe': pr, 'timings_seconds': {'probe': round(t1 - t0, 2), 'proxy': round(t2 - t1, 2),
                                               'sheet': round(t3 - t2, 2), 'total': round(t3 - t0, 2)},
-            'cached': False}
+            'cached': False, 'requested_sheet_fps': sheet_fps,
+            'artifact_sha256': {name: digest(d / name) for name in ('proxy.mp4', 'sheet.jpg')}}
     write_json(meta_path, meta)
     return meta
 
@@ -508,7 +514,7 @@ def cmd_index(a) -> int:
         print('two clips share a stem, so they would share an index folder: ' + ', '.join(dupes)
               + '. Index one dump at a time, or rename one copy.', file=sys.stderr)
         return 2
-    hashes = known_hashes(dest)
+    hashes = getattr(a, 'verified_hashes', None) or known_hashes(dest)
     print(f'indexing {len(clips)} clips into {index_dir} ({a.workers} workers)', flush=True)
     metas, failed = [], []
     with concurrent.futures.ThreadPoolExecutor(max_workers=a.workers) as pool:
@@ -1115,10 +1121,12 @@ def whisper_segments(result: dict) -> list[dict]:
     segs = []
     for s in result.get('segments', []):
         text = s['text'].strip()
-        segs.append({'start': round(s['start'], 2), 'end': round(s['end'], 2), 'text': text,
-                     'doubtful': whisper_doubtful({**s, 'text': text}),
-                     'avg_logprob': round(s.get('avg_logprob', 0), 3), 'no_speech_prob': round(s.get('no_speech_prob', 0), 3),
-                     'compression_ratio': round(s.get('compression_ratio', 0), 3)})
+        # The live model can return NumPy scalars, which json cannot serialize.
+        segs.append({'start': round(float(s['start']), 2), 'end': round(float(s['end']), 2), 'text': text,
+                     'doubtful': bool(whisper_doubtful({**s, 'text': text})),
+                     'avg_logprob': round(float(s.get('avg_logprob', 0)), 3),
+                     'no_speech_prob': round(float(s.get('no_speech_prob', 0)), 3),
+                     'compression_ratio': round(float(s.get('compression_ratio', 0)), 3)})
     return segs
 
 
@@ -1131,7 +1139,7 @@ def write_transcript(target: Path, record: dict, audio_seconds: float) -> int:
     """Marks every segment the rules doubt (a mark is never cleared), then writes the .txt without
     them and the JSON with them. The JSON goes last because its presence is what a rerun skips on."""
     for s in record['segments']:
-        s['doubtful'] = s['doubtful'] or whisper_doubtful(s) or stretched(s, audio_seconds)
+        s['doubtful'] = bool(s['doubtful'] or whisper_doubtful(s) or stretched(s, audio_seconds))
     txt = ''.join(f"{transcript_stamp(s['start'])}-{transcript_stamp(s['end'])}  {s['text']}\n"
                   for s in record['segments'] if not s['doubtful'] and s['text'])
     # ensure_ascii=False: the invented foreign words are the text a person checks, so keep them readable.
@@ -1259,6 +1267,309 @@ def cmd_transcribe(a) -> int:
         print(f"{len(failed)} clip(s) failed to transcribe: {', '.join(failed)}", file=sys.stderr)
         return 1
     return 0
+
+# ---------------------------------------------------------------- analyze
+
+ANALYSIS_VERSION = 1
+
+
+def source_state(path: Path) -> dict:
+    before = path.stat()
+    sha = digest(path)
+    after = path.stat()
+    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+        raise ValueError(f'source changed while hashing: {path}')
+    return {'path': str(path), 'bytes': after.st_size, 'mtime_ns': after.st_mtime_ns, 'sha256': sha}
+
+
+def analysis_audio_stream(pr: dict) -> dict | None:
+    streams = [s for s in pr['streams'] if s['codec_type'] == 'audio']
+    if not streams:
+        return None
+    if len(streams) == 1:
+        return streams[0]
+    defaults = [s for s in streams if s.get('disposition', {}).get('default') == 1 and s.get('channels') == 2]
+    if len(defaults) == 1 and all(s == defaults[0] or
+                                 (s.get('codec_tag_string') == 'apac' and s.get('channels') == 4)
+                                 for s in streams):
+        return defaults[0]
+    raise ValueError('multiple audio streams need an explicit mapping; no unambiguous default stereo stream')
+
+
+def channel_hash(path: Path, stream: int, channel: int) -> str:
+    """Hash decoded float32 samples without retaining the whole recording in memory."""
+    result = run(['ffmpeg', '-nostdin', '-v', 'error', '-i', str(path), '-map', f'0:{stream}',
+                  '-af', f'pan=mono|c0=c{channel}', '-c:a', 'pcm_f32le',
+                  '-f', 'hash', '-hash', 'sha256', '-'], timeout=1800).strip()
+    if not re.fullmatch(r'SHA256=[a-fA-F0-9]{64}', result):
+        raise ValueError(f'no decoded audio hash from {path}')
+    return result.split('=', 1)[1].lower()
+
+
+def verify_filled_audio(wav: Path, sample_rate: int, expected: str) -> dict:
+    pr = probe(wav)
+    audio = [s for s in pr['streams'] if s['codec_type'] == 'audio']
+    if len(audio) != 1 or audio[0].get('channels') != 2 or \
+            int(audio[0].get('sample_rate', 0)) != sample_rate or audio[0].get('codec_name') != 'pcm_f32le':
+        raise ValueError(f'wrong channel-filled WAV format: {wav}')
+    stream = audio[0]['index']
+    if any(channel_hash(wav, stream, ch) != expected for ch in (0, 1)):
+        raise ValueError(f'WAV channels do not exactly match the selected source channel: {wav}')
+    return {'sha256': digest(wav), 'bytes': wav.stat().st_size, 'sample_rate': sample_rate,
+            'channels': 2, 'codec': 'pcm_f32le', 'duration_seconds': float(pr['format']['duration']),
+            'decoded_channel_sha256': expected, 'both_channels_match_source': True}
+
+
+def export_filled_audio(source: Path, stream: dict, channel: int, wav: Path, force: bool) -> dict:
+    expected = channel_hash(source, stream['index'], channel)
+    rate = int(stream['sample_rate'])
+    if wav.exists() and not force:
+        return {**verify_filled_audio(wav, rate, expected), 'cached': True}
+    wav.parent.mkdir(parents=True, exist_ok=True)
+    # A unique temporary file never exposes a partial export at its final name.
+    with tempfile.TemporaryDirectory(prefix='.audio-', dir=wav.parent) as tmp:
+        partial = Path(tmp) / 'channel.wav'
+        run(['ffmpeg', '-nostdin', '-v', 'error', '-i', str(source), '-map', f'0:{stream["index"]}',
+             '-af', f'pan=stereo|c0=c{channel}|c1=c{channel}', '-c:a', 'pcm_f32le', str(partial)], timeout=1800)
+        verified = verify_filled_audio(partial, rate, expected)
+        os.replace(partial, wav)
+    return {**verified, 'cached': False}
+
+
+def analysis_transcript(wav: Path, target: Path, identity: dict, audio_seconds: float,
+                        offset: float, force: bool) -> dict:
+    cached = target.exists() and not force
+    if cached:
+        record = json.loads(target.read_text())
+        if any(record.get(k) != v for k, v in identity.items()):
+            raise ValueError(f'transcript belongs to different source audio or analysis version: {target}')
+    else:
+        import mlx_whisper
+        if not WHISPER_SNAPSHOT.is_dir():
+            raise ValueError(f'pinned Whisper model is missing: {WHISPER_SNAPSHOT}')
+        raw = mlx_whisper.transcribe(str(wav), path_or_hf_repo=str(WHISPER_SNAPSHOT), language='en',
+                                    condition_on_previous_text=False, word_timestamps=True,
+                                    hallucination_silence_threshold=2.0)
+        segments = whisper_segments(raw)
+        for segment, original in zip(segments, raw.get('segments', [])):
+            segment['doubtful'] = segment['doubtful'] or stretched(segment, audio_seconds)
+            segment['start'] = round(segment['start'] + offset, 3)
+            segment['end'] = round(segment['end'] + offset, 3)
+            segment['words'] = [{'word': str(word['word']), 'start': round(float(word['start']) + offset, 3),
+                                'end': round(float(word['end']) + offset, 3),
+                                'probability': float(word.get('probability', 0))}
+                               for word in original.get('words', [])]
+        record = {**identity, 'audio_file': str(wav), 'audio_offset_seconds': offset,
+                  'timestamp_basis': 'seconds from the beginning of the original video',
+                  'speaker_identity': 'unassigned', 'note': TRANSCRIPT_NOTE, 'segments': segments}
+    target.parent.mkdir(parents=True, exist_ok=True)
+    kept = write_transcript(target, record, identity['source_seconds'])
+    return {'transcript_json': str(target), 'transcript_txt': str(target.with_suffix('.txt')),
+            'transcript_sha256': digest(target), 'transcript_txt_sha256': digest(target.with_suffix('.txt')),
+            'kept_segments': kept, 'doubtful_segments': len(record['segments']) - kept,
+            'transcript_cached': cached}
+
+
+def analyze_clip_audio(item: dict, out: Path, force: bool) -> None:
+    source = Path(item['source']['path'])
+    pr = probe(source)
+    stream = analysis_audio_stream(pr)
+    item['audio_stream'] = stream
+    item['other_audio_streams'] = [s for s in pr['streams'] if s['codec_type'] == 'audio' and s != stream]
+    item['tracks'] = []
+    if stream is None:
+        item['audio_status'] = 'no-audio'
+        return
+    channels = int(stream['channels'])
+    if channels < 1:
+        raise ValueError('audio stream has no channels')
+    offset = float(stream.get('start_time', 0)) - float(pr['format'].get('start_time', 0))
+    if offset < -0.002:
+        raise ValueError('negative audio start offset needs review')
+    offset = max(0.0, offset)
+    for ch in range(channels):
+        name = TRANSCRIPT_CHANNELS[ch] if channels == 2 else 'mono' if channels == 1 else f'channel{ch + 1}'
+        wav = out / 'audio' / f'{item["source_id"]}_{name}.wav'
+        exported = export_filled_audio(source, stream, ch, wav, force)
+        identity = {'analysis_version': ANALYSIS_VERSION, 'source_path': str(source),
+                    'source_sha256': item['source']['sha256'], 'source_seconds': float(pr['format']['duration']),
+                    'clip_id': item['source_id'], 'channel': name, 'channel_index': ch,
+                    'audio_sha256': exported['sha256'], 'model': f'{WHISPER_REPO}@{WHISPER_REVISION}'}
+        target = out / 'transcripts' / f'{item["source_id"]}_{name}.json'
+        transcript = analysis_transcript(wav, target, identity, exported['duration_seconds'], offset, force)
+        item['tracks'].append({'channel': name, 'channel_index': ch, 'audio_file': str(wav),
+                               **exported, **transcript})
+        print(f'  {source.stem} {name}: audio verified; {transcript["kept_segments"]} transcript segments'
+              + (' (cached)' if transcript['transcript_cached'] else ''), flush=True)
+    item['audio_status'] = 'complete'
+
+
+def analysis_indexes(out: Path, report: dict) -> None:
+    clips, segments = [], []
+    text = ['Machine transcripts; verify wording and speakers against the original clip before quoting.',
+            'Times are seconds from the original video. Doubtful segments remain in SEARCH.csv and transcript JSON.', '']
+    for item in report['clips']:
+        meta = item.get('index', {})
+        clips.append({'clip': item['clip'], 'source_id': item['source_id'], 'source': item['source']['path'],
+                      'sha256': item['source']['sha256'], 'status': item['status'],
+                      'seconds': meta.get('duration_seconds', ''), 'width': meta.get('width', ''),
+                      'height': meta.get('height', ''), 'fps': meta.get('fps', ''),
+                      'audio_status': item.get('audio_status', 'pending'),
+                      'audio_files': '; '.join(t['audio_file'] for t in item['tracks']),
+                      'transcripts': '; '.join(t['transcript_txt'] for t in item['tracks']),
+                      'proxy': str(out / 'index' / meta['proxy']) if meta else '',
+                      'contact_sheet': str(out / 'index' / meta['sheet']) if meta else '',
+                      'error': item.get('error', '')})
+        for track in item['tracks']:
+            transcript = json.loads(Path(track['transcript_json']).read_text())
+            text.extend([f'{item["clip"]} / {track["channel"]}', item['source']['path']])
+            for seg in transcript['segments']:
+                segments.append({'clip': item['clip'], 'channel': track['channel'], 'start': seg['start'],
+                                 'end': seg['end'], 'text': seg['text'], 'doubtful': seg['doubtful'],
+                                 'source': item['source']['path'], 'audio_file': track['audio_file']})
+                if not seg['doubtful']:
+                    text.append(f'{transcript_stamp(seg["start"])}-{transcript_stamp(seg["end"])}  {seg["text"]}')
+            text.append('')
+    for name, rows, fields in (
+            ('CLIP-INDEX.csv', clips, ['clip', 'source_id', 'source', 'sha256', 'status', 'seconds', 'width',
+                                      'height', 'fps', 'audio_status', 'audio_files', 'transcripts', 'proxy',
+                                      'contact_sheet', 'error']),
+            ('SEARCH.csv', segments, ['clip', 'channel', 'start', 'end', 'text', 'doubtful', 'source', 'audio_file'])):
+        tmp = out / f'{name}.tmp'
+        with tmp.open('w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(rows)
+        os.replace(tmp, out / name)
+    tmp = out / 'SEARCH.txt.tmp'
+    tmp.write_text('\n'.join(text))
+    os.replace(tmp, out / 'SEARCH.txt')
+    report['counts'] = {'clips': len(report['clips']), 'indexed': sum(bool(c.get('index')) for c in report['clips']),
+                        'audio_clips': sum(c.get('audio_status') == 'complete' for c in report['clips']),
+                        'no_audio_clips': sum(c.get('audio_status') == 'no-audio' for c in report['clips']),
+                        'channel_wavs': sum(len(c['tracks']) for c in report['clips']),
+                        'transcripts': sum(len(c['tracks']) for c in report['clips']),
+                        'search_segments': len(segments), 'doubtful_segments': sum(s['doubtful'] for s in segments),
+                        'failed_clips': sum(c['status'] == 'failed' for c in report['clips'])}
+    write_json(out / 'analysis.json', report)
+
+
+def analyze_batch(a, out: Path, clips: list[Path]) -> int:
+    started = time.monotonic()
+    sources = {str(c): source_state(c) for c in clips}
+    for path, expected in a.expected_hashes.items():
+        if path in sources and sources[path]['sha256'] != expected:
+            raise ValueError(f'source differs from the verified ingest manifest: {path}')
+    manifest = out / 'analysis.json'
+    if manifest.exists():
+        old = json.loads(manifest.read_text())
+        if old.get('sources') != sources:
+            raise ValueError('this output belongs to different or changed source files; use a new --out folder')
+        if old.get('analysis_version') != ANALYSIS_VERSION and not a.force:
+            raise ValueError('analysis version changed; rerun with --force to rebuild this batch')
+    elif any(p.name != '.analysis.lock' for p in out.iterdir()):
+        raise ValueError('output already contains files without an analysis manifest; use an empty --out folder')
+    report = {'analysis_version': ANALYSIS_VERSION, 'state': 'processing', 'sources': sources,
+              'tool_sha256': digest(Path(__file__)), 'started_at': datetime.now().astimezone().isoformat(),
+              'source_policy': 'Read originals only; compare source SHA256, sizes and modification times before and after.',
+              'audio_treatment': 'One native-rate float32 stereo WAV per recorded channel; that channel fills both ears. No gain, denoise or voice separation.',
+              'transcript_note': TRANSCRIPT_NOTE, 'clips': []}
+    for source in clips:
+        report['clips'].append({'clip': source.stem, 'source_id': transcript_id(source),
+                                 'source': sources[str(source)], 'status': 'pending', 'tracks': []})
+    analysis_indexes(out, report)
+    index_args = argparse.Namespace(input=[str(c) for c in clips], out=str(out), dest=None,
+                                    selects=None, reset_cards=False, workers=a.workers, sheet_fps=a.sheet_fps,
+                                    force=a.force, verified_hashes={p: s['sha256'] for p, s in sources.items()})
+    cmd_index(index_args)
+    indexed = json.loads((out / 'index/index.json').read_text())
+    metas = {m['clip']: m for m in indexed['clips']}
+    failures = {m['clip']: m['error'] for m in indexed['failed']}
+    for number, item in enumerate(report['clips'], 1):
+        print(f'analyzing audio {number}/{len(clips)}: {item["clip"]}', flush=True)
+        errors = []
+        if item['clip'] in metas:
+            item['index'] = metas[item['clip']]
+        else:
+            errors.append('index: ' + failures.get(item['clip'], 'missing index result'))
+        try:
+            analyze_clip_audio(item, out, a.force)
+        except Exception as e:
+            item['audio_status'] = 'failed'
+            errors.append('audio: ' + (str(e) or type(e).__name__))
+        item['status'] = 'failed' if errors else 'complete'
+        if errors:
+            item['error'] = '; '.join(errors)[-1600:]
+            print(f'  FAILED: {item["error"]}', flush=True)
+        analysis_indexes(out, report)
+    changed = []
+    for source in clips:
+        try:
+            if source_state(source) != sources[str(source)]:
+                changed.append(str(source))
+        except OSError:
+            changed.append(str(source))
+    report.update(changed_sources=changed, originals_unchanged=not changed,
+                  state='failed' if changed or report['counts']['failed_clips'] else 'complete',
+                  finished_at=datetime.now().astimezone().isoformat(),
+                  elapsed_seconds=round(time.monotonic() - started, 1))
+    analysis_indexes(out, report)
+    (out / 'START-HERE.txt').write_text(
+        'Clip analysis\n\n'
+        f'Status: {report["state"]}\n'
+        'CLIP-INDEX.csv links each original to its preview, contact sheet, channel WAVs and transcripts.\n'
+        'SEARCH.txt contains timestamped transcript text; SEARCH.csv also includes doubtful segments.\n'
+        'audio/ holds one WAV per recorded channel, with that channel in both ears.\n'
+        'transcripts/ holds text and JSON, including word timestamps and doubtful flags.\n'
+        'index/ holds clip metadata, previews and contact sheets.\n'
+        'shot-cards.csv is for your clip notes and edit ranges; existing entries survive reruns.\n'
+        'analysis.json records source hashes, output checks and any failures.\n\n'
+        'Transcripts are machine generated. Listen to the original before quoting or assigning a speaker.\n')
+    print(json.dumps({'state': report['state'], 'originals_unchanged': not changed, **report['counts']}), flush=True)
+    print(f'analysis: {out / "START-HERE.txt"}', flush=True)
+    return 0 if report['state'] == 'complete' else 1
+
+
+def cmd_analyze(a) -> int:
+    out = Path(a.out).expanduser().resolve()
+    try:
+        if a.workers < 1 or not (0 < a.sheet_fps <= 30):
+            raise ValueError('--workers must be positive and --sheet-fps must be between 0 and 30')
+        a.expected_hashes = {}
+        for raw in a.input:
+            p = Path(raw).expanduser().resolve()
+            if p.is_dir():
+                ingest = p / 'ingest-manifest.json'
+                if ingest.exists():
+                    batch = json.loads(ingest.read_text())
+                    if batch.get('state') != 'verified-complete':
+                        raise ValueError(f'ingest is not verified-complete: {ingest}')
+                    for row in batch['files']:
+                        if row['kind'] == 'video-original':
+                            a.expected_hashes[str(Path(row['destination']).resolve())] = row['sha256']
+                elif p == out or p in out.parents:
+                    raise ValueError('--out must be outside an input video directory; use a sibling review folder')
+        clips = [c.resolve() for c in resolve_clips(a.input, None)]
+        if not clips:
+            raise ValueError('no clips found')
+        if any(out == c or out in c.parents for c in clips):
+            raise ValueError('--out must not contain an original clip')
+        for names in ([c.stem.casefold() for c in clips], [transcript_id(c).casefold() for c in clips]):
+            if len(names) != len(set(names)):
+                raise ValueError('two clips share an index or transcript ID; analyze separate batches or rename a copy')
+        if out.exists() and any(p.is_symlink() for p in out.rglob('*')):
+            raise ValueError('analysis output contains symlinks; use a separate output folder')
+        out.mkdir(parents=True, exist_ok=True)
+        with (out / '.analysis.lock').open('a') as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise ValueError('another analyze process is writing this output folder') from None
+            return analyze_batch(a, out, clips)
+    except (OSError, ValueError) as e:
+        print(f'analyze: {e}', file=sys.stderr)
+        return 2
+
 
 # ---------------------------------------------------------------- catalog
 
@@ -1623,6 +1934,14 @@ def main(argv=None) -> int:
     p.add_argument('--refilter', action='store_true',
                    help='re-apply the doubtful rules to every transcript in --out, without Whisper')
     p.set_defaults(fn=cmd_transcribe)
+
+    p = sub.add_parser('analyze', help='index clips, retain channel-filled WAVs, transcribe and build search indexes')
+    p.add_argument('input', nargs='+', help='clip files, video folders, or ingest batch folders')
+    p.add_argument('--out', required=True, help='batch analysis folder outside the original video folder')
+    p.add_argument('--workers', type=int, default=3, help='parallel visual-index workers (default 3); transcription is serial')
+    p.add_argument('--sheet-fps', type=float, default=1.0, help='contact-sheet sampling rate (default 1)')
+    p.add_argument('--force', action='store_true', help='rebuild derived files for the same unchanged sources')
+    p.set_defaults(fn=cmd_analyze)
 
     p = sub.add_parser('catalog', help='add an imported event folder to the clip library (dry run unless --write)')
     p.add_argument('event_dir', help='the event folder inside the library, e.g. <library>/2026-dump/video/2026-10-22-practice-and-office')

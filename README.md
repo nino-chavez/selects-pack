@@ -8,7 +8,7 @@ the editor.
 T=~/Workspace/dev/tools/selects-pack/selects-pack
 
 $T ingest /Volumes/Untitled "/Volumes/Untitled 1" --event tps-opening-weekend-2026-10-17 --batch 4
-$T index  /Volumes/photo/630/2026-dump/review/tps-opening-weekend-2026-10-17/batch-4 --out ~/Workspace/create/campaigns/<campaign>/selects-pack
+uv run --with mlx-whisper --with Pillow "$T" analyze /Volumes/photo/630/2026-dump/review/tps-opening-weekend-2026-10-17/batch-4 --out ~/Workspace/create/campaigns/<campaign>/selects-pack
 # look at <out>/index/<clip>/sheet.jpg, fill in/out in <out>/shot-cards.csv
 $T pack   ~/Workspace/create/campaigns/<campaign>/selects-pack --overlays <campaign>/generic-overlays --identity 630-volleyball
 ```
@@ -28,10 +28,10 @@ live in 630-marketing-automation, `docs/internal/ops/RAW-FOOTAGE-WORKFLOW-PROPOS
 - Python 3.10 or newer with Pillow (`python3 -c "import PIL"` must pass).
 - `ffmpeg` and `ffprobe` on PATH (`brew install ffmpeg`).
 - No install step. Run `selects-pack` by path, or symlink it into `~/.local/bin`.
-- `transcribe` only: Apple silicon, mlx-whisper through uv, and the pinned model snapshot in the
+- `transcribe` and `analyze`: Apple silicon, mlx-whisper through uv, and the pinned model snapshot in the
   Hugging Face cache. selects-pack does not install mlx-whisper, and no other command needs it.
-- Tests: `python3 -m unittest discover -s tests` from the repo root. They need neither the
-  model nor ffmpeg.
+- Tests: `python3 -m unittest discover -s tests` from the repo root. No test needs the model.
+  Audio and preview integration tests run when ffmpeg, ffprobe and Pillow are installed; otherwise those tests skip.
 
 ## Commands
 
@@ -69,6 +69,54 @@ Copy-only ingest of mounted cards into the existing SSD layout, lifted from the 
 - The manifest is the batch-3 shape plus `source_id` (the destination stem) and
   `card_profiles`. It is rewritten after every file, so a stopped run can be rerun.
 
+### analyze
+
+    uv run --with mlx-whisper --with Pillow selects-pack analyze <input>... --out DIR [--workers N] [--sheet-fps N] [--force]
+
+Analyze a new batch in one command: create clip previews and contact sheets, extract audio,
+fill both ears from each recorded channel, transcribe, and build searchable indexes.
+Original clips stay unchanged.
+
+```text
+analysis/
+  START-HERE.txt       output guide and completion status
+  CLIP-INDEX.csv      originals, metadata, previews, audio and transcript paths
+  SEARCH.txt         timestamped transcript text, with doubtful segments omitted
+  SEARCH.csv         all transcript segments, including doubtful flags
+  analysis.json      source hashes, output verification and failures
+  shot-cards.csv     clip notes and edit ranges for the editor
+  index/<clip>/      preview, contact sheet and metadata
+  audio/             <clip>_left.wav and <clip>_right.wav
+  transcripts/       matching text and JSON, including word timestamps
+```
+
+- `<input>`: clip files, video folders, or a completed ingest-batch folder. An ingest manifest
+  must say `verified-complete`; its recorded source hashes must match the current files.
+- `--out`: a separate analysis folder, outside any input video folder. Each output folder belongs
+  to one batch. Rerunning with different or changed sources stops before replacing its outputs.
+- Audio exports preserve the native sample rate as float32 WAV. Each source channel becomes a
+  separate stereo file with that channel in both ears. Voices already overlapping on that channel remain.
+  Mono sources produce `_mono.wav`; sources with more than two channels use `_channel1.wav`, and so on.
+- Multiple audio streams require an unambiguous default stereo stream with only additional four-channel
+  APAC streams. Other layouts stop that clip for review. All streams remain in the original.
+- Transcripts use the same pinned Whisper model and doubtful-segment rules as `transcribe`.
+  Segment and word timestamps refer to the original video, including its audio start offset.
+  Speakers remain unassigned; check wording by ear before quoting.
+- `--workers`: parallel preview/contact-sheet jobs, default 3. Transcription runs one channel at a time.
+- `--sheet-fps`: contact-sheet sampling rate, default 1. Use `detail` later for finer inspection.
+- A rerun verifies existing audio against the original channel, reuses matching transcripts,
+  and checks preview/contact-sheet hashes before reusing them. Existing shot-card notes survive.
+- `--force`: rebuild derived files for the same unchanged batch. It cannot bypass source identity
+  checks. Use a new output folder for different source footage.
+- A failed clip stays explicit in `analysis.json`; the rest continue. No-audio clips still get
+  a visual index. Exit status is nonzero for failed outputs or changed originals.
+- Source SHA-256, size and modification time are compared before and after processing.
+  Each WAV's two decoded channels must exactly match the selected original channel.
+  The command also refuses concurrent writers and symlinks inside its output folder.
+
+The channel-export behavior comes from the earlier SSD audio-library processor. This command
+accepts a fresh batch directly and does not depend on that processor's saved `PLAN.json`.
+
 ### index
 
     selects-pack index <input>... --out DIR [--selects clip-selects.csv] [--sheet-fps N] [--workers N] [--force]
@@ -86,8 +134,8 @@ and one row in `<out>/shot-cards.csv`.
 - `--sheet-fps`: frames per second on the sheet, default 1. Clips over 40 s are sampled
   more sparsely so a sheet stays near 40 tiles.
 - `--workers`: parallel clips, default 3.
-- `--force`: rebuild proxies and sheets. A clip whose sha256 and index version match its
-  `clip.json` is otherwise reused.
+- `--force`: rebuild proxies and sheets. Reuse requires matching source hash, index version,
+  sampling rate, and recorded hashes of the preview and sheet. Older metadata rebuilds once.
 - `shot-cards.csv` rows typed by hand survive every rerun: without `--selects`, existing
   rows are kept by clip and only new clips are appended. `--selects` replaces the rows;
   `--reset-cards` empties them.

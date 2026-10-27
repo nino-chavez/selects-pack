@@ -41,6 +41,8 @@ CHUNK = 8 * 1024 * 1024
 INDEX_VERSION = 1
 VIDEO_SUFFIXES = {'.MP4', '.MOV'}
 PHOTO_SUFFIXES = {'.ARW', '.DNG', '.JPG', '.JPEG', '.HEIC', '.HIF'}
+# Ingest kinds that an organize step moves into event folders after the copy.
+MEDIA_KINDS = {'video-original', 'video-sidecar', 'photo-original', 'camera-video-proxy'}
 SHOT_CARD_FIELDS = ['clip', 'observed_subject', 'candidate_in_seconds', 'candidate_out_seconds',
                     'editorial_note', 'alternates']
 # 'a–b', 'a-b' or 'a to b', seconds, optional trailing s. The 2026-10-18 measurement had to
@@ -173,6 +175,68 @@ def read_prior_manifests(dest: Path, skip: Path | None = None) -> dict:
     return rows
 
 
+def read_move_logs(dest: Path) -> dict:
+    """from -> to for every file an organize step moved out of the ingest destinations, read from the
+    move logs beside earlier manifests (organize-moves.json, organization-moves.json: lists of
+    {from, to, sha256}, the same shape `catalog --moves` reads)."""
+    moves = {}
+    for m in sorted(dest.glob('review/*/batch-*/*moves.json')):
+        try:
+            entries = json.loads(m.read_text())
+        except (OSError, ValueError) as e:
+            print(f'warning: cannot read {m}: {e}', file=sys.stderr)
+            continue
+        for e in entries if isinstance(entries, list) else []:
+            if isinstance(e, dict) and e.get('from') and e.get('to'):
+                moves[e['from']] = e['to']
+    return moves
+
+
+def moved_to(path: str, moves: dict) -> str:
+    """Where a file ended up after every logged move, following a chain of moves."""
+    seen = set()
+    while path in moves and path not in seen:
+        seen.add(path)
+        path = moves[path]
+    return path
+
+
+def dump_media_by_size(dest: Path) -> dict:
+    """Files in the dump by size, for finding a copy that was moved or renamed without a log.
+    review/ and card-support/ hold reports and camera housekeeping, not media; hidden files and
+    partial copies never count."""
+    out = {}
+    for d, dirs, names in os.walk(dest):
+        dirs[:] = [x for x in dirs if not x.startswith('.')
+                   and not (Path(d) == dest and x in ('review', 'card-support'))]
+        for n in names:
+            if n.startswith('.') or '.copying' in n:
+                continue
+            p = Path(d) / n
+            out.setdefault(p.stat().st_size, []).append(p)
+    return out
+
+
+def locate_copy(src: Path, size: int, candidates: list, moves: dict, by_size, source_hash: str | None = None):
+    """An SSD file already holding this card file's bytes, as (path, how, source_hash).
+
+    Looks at each earlier destination and where the move logs took it, then at every dump file of
+    the same size (`by_size` is called only when needed). The source is hashed only when some
+    candidate has its size, so a new file is read once, by the copy. how is 'earlier-destination',
+    'move-log' or 'content-search'; path and how are None when no copy matches."""
+    seen, paths = set(), []
+    for c in candidates:
+        paths += [(Path(c), 'earlier-destination'), (Path(moved_to(c, moves)), 'move-log')]
+    for p, how in paths + [(p, 'content-search') for p in by_size().get(size, [])]:
+        if p in seen or not p.is_file() or p.stat().st_size != size:
+            continue
+        seen.add(p)
+        source_hash = source_hash or digest(src)
+        if digest(p) == source_hash:
+            return p, how, source_hash
+    return None, None, source_hash
+
+
 # ---------------------------------------------------------------- ingest
 
 def card_profile(root: Path) -> str:
@@ -220,6 +284,19 @@ def cmd_ingest(a) -> int:
         return 2
     profiles = {root: card_profile(root) for root in roots}
     previous = read_prior_manifests(dest, skip=manifest)
+    moves = read_move_logs(dest)
+    # The same card can mount under another name (Untitled, then CFExpress), so earlier rows are
+    # also found by file name and size; the hash decides.
+    by_name = {}
+    for r in previous.values():
+        by_name.setdefault((Path(r['source']).name, r['bytes']), []).append(r['destination'])
+    sizes = {}
+
+    def by_size():
+        if not sizes:
+            sizes.update(dump_media_by_size(dest))
+        return sizes
+
     review.mkdir(parents=True, exist_ok=True)
     files = inventory(roots, a.since)
     required = sum(p.stat().st_size for _, p in files if prior_row(previous, p) is None)
@@ -259,8 +336,17 @@ def cmd_ingest(a) -> int:
         kind, target = classify(root, src)
         prior = prior_row(previous, src, before)
         source_hash = digest(src) if target.exists() else None
+        held = source_hash is not None and digest(target) == source_hash
+        located_by = None
+        if kind in MEDIA_KINDS and not held:
+            # Organizing moves media out of video/ and photo/ into event folders. A card read again
+            # still holds it; find the moved copy and verify it rather than copy a second one.
+            candidates = ([prior['destination']] if prior else []) + by_name.get((src.name, before.st_size), [])
+            found, located_by, source_hash = locate_copy(src, before.st_size, candidates, moves, by_size, source_hash)
+            if found is not None:
+                target, held = found, True
         collision = False
-        if target.exists() and digest(target) != source_hash:
+        if target.exists() and not held:
             collision = True
             if kind == 'camera-support':
                 target = support_root / root.name.lower().replace(' ', '-') / src.relative_to(root)
@@ -300,10 +386,12 @@ def cmd_ingest(a) -> int:
                'operation': operation, 'bytes': before.st_size, 'sha256': source_hash,
                'source_mtime_ns': before.st_mtime_ns, 'source_stable': True,
                'filename_collision': collision,
-               'previous_sha256': prior['sha256'] if prior else None}
+               'previous_sha256': prior['sha256'] if prior else None,
+               'located_by': located_by}
         report['files'].append(row)
         write_json(manifest, report)
-        print(f'{i}/{len(files)} {operation}: {src.name} ({before.st_size:,} bytes)', flush=True)
+        where = f', at {target} by {located_by}' if located_by else ''
+        print(f'{i}/{len(files)} {operation}: {src.name} ({before.st_size:,} bytes{where})', flush=True)
     initial = {str(src) for _, src in files}
     final = {str(src) for _, src in inventory(roots, a.since)}
     report['source_inventory_changed'] = sorted(initial ^ final)

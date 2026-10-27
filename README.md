@@ -47,10 +47,10 @@ Copy-only ingest of mounted cards into the existing SSD layout, lifted from the 
 - `--event`, `--batch`: the review folder, `<dest>/review/<event>/batch-<N>`, which receives
   `ingest-manifest.json`.
 - `--date`: the folder date for camera-support files, default today.
-- `--since`: only card files modified on or after this local date. Use it for a card that still
-  holds recordings imported earlier: those were renamed into event folders afterwards, so a full
-  pass would copy them again. Use it too for older material that is not part of this batch. Files
-  before the date stay on the card and out of the manifest; the manifest records the date.
+- `--since`: only card files modified on or after this local date. Use it to keep older material
+  that is not part of this batch out of the manifest, and to skip hashing recordings imported
+  earlier. Files before the date stay on the card; the manifest records the date. It is no longer
+  what stops a second copy: media already on the SSD is verified in place (below).
 - Card type is detected per root: DJI (`DJI_*` files or `.LRF` proxies), Sony video
   (`PRIVATE/M4ROOT/CLIP`), Sony photo (`DCIM`).
 - Destinations: video to `video/` (DJI to `video/dji-osmo-pocket/`), `.LRF` to
@@ -65,6 +65,17 @@ Copy-only ingest of mounted cards into the existing SSD layout, lifted from the 
   camera-support files at the destination they already have. A prior row matches on path,
   size and mtime together, because a reformatted Sony card mounts at the same path and
   restarts clip numbering. Rows written before mtime was recorded match on path and size.
+- Media already on the SSD is not copied again after it was organized into an event folder.
+  Before copying a video, sidecar, proxy or photo, ingest looks for a file with the same bytes:
+  the destination an earlier manifest recorded, where the move logs beside earlier manifests
+  (`organize-moves.json`, `organization-moves.json`) took it, then any file of the same size in
+  the dump outside `review/` and `card-support/`. A match is verified by SHA-256 and recorded as
+  `existing-content-verified` at its current path, with `located_by` set to
+  `earlier-destination`, `move-log` or `content-search` (null for every other row). Earlier rows
+  match by file name and size as well as path, because the same card can mount under another
+  name (`Untitled` on Oct 24, `CFExpress` on Oct 27). A moved file with different bytes is not a
+  copy, so the card file is copied again to the default destination. Before this, a card read
+  again after organizing copied every clip a second time.
 - Needs free space for the new files plus 1 GiB, or it stops before copying.
 - The manifest is the batch-3 shape plus `source_id` (the destination stem) and
   `card_profiles`. It is rewritten after every file, so a stopped run can be rerun.
@@ -398,6 +409,14 @@ clip differs from the source frame at its in-point by under 1 grey level on aver
 the frame half a second later by 20 to 73, so the check can fail and did not. `ingest` was exercised on a scratch card
 pair with a planted differing destination file. The original stayed untouched and the new
 file landed with a hash suffix. No real card was mounted during the dry run.
+
+Re-reading a card after organizing (Oct 27): `tests/test_ingest.py` ingests a fake card, moves
+its clips into an event folder with and without a move log, and ingests again. Four of its five
+tests fail on the code before the fix (the fifth guards against counting `card-support/` as a
+copy), and all five fail when the hash comparison is removed. Read-only against the photo SSD,
+the move logs resolved 98 earlier media rows that no longer sit at their recorded destination.
+68 Oct 17 rows, written before the `630/` folder existed, have a same-name, same-size file at a
+new path that only the content search reaches.
 
 ## Limits
 

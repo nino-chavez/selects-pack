@@ -69,9 +69,12 @@ Copy-only ingest of mounted cards into the existing SSD layout, lifted from the 
   Before copying a video, sidecar, proxy or photo, ingest looks for a file with the same bytes:
   the destination an earlier manifest recorded, where the move logs beside earlier manifests
   (`organize-moves.json`, `organization-moves.json`) took it, then any file of the same size in
-  the dump outside `review/` and `card-support/`. A match is verified by SHA-256 and recorded as
+  the dump outside `review/` and `card-support/` that keeps the camera file name (`C3008.MP4`,
+  `…__C3008.MP4`). Size alone is not searched: uncompressed Sony RAWs share one size, so a new
+  still would read every earlier one. A match is verified by SHA-256 and recorded as
   `existing-content-verified` at its current path, with `located_by` set to
-  `earlier-destination`, `move-log` or `content-search` (null for every other row). Earlier rows
+  `earlier-destination`, `move-log` or `dump-search` (null for every other row). A copy renamed
+  without the camera name is not found and is copied again. Earlier rows
   match by file name and size as well as path, because the same card can mount under another
   name (`Untitled` on Oct 24, `CFExpress` on Oct 27). A moved file with different bytes is not a
   copy, so the card file is copied again to the default destination. Before this, a card read
@@ -411,12 +414,13 @@ pair with a planted differing destination file. The original stayed untouched an
 file landed with a hash suffix. No real card was mounted during the dry run.
 
 Re-reading a card after organizing (Oct 27): `tests/test_ingest.py` ingests a fake card, moves
-its clips into an event folder with and without a move log, and ingests again. Four of its five
-tests fail on the code before the fix (the fifth guards against counting `card-support/` as a
-copy), and all five fail when the hash comparison is removed. Read-only against the photo SSD,
-the move logs resolved 98 earlier media rows that no longer sit at their recorded destination.
-68 Oct 17 rows, written before the `630/` folder existed, have a same-name, same-size file at a
-new path that only the content search reaches.
+its clips into an event folder with and without a move log, and ingests again. Four of its seven
+tests fail on the code before the fix; the other three guard the search's limits. Removing the
+hash comparison fails the moved-copy-with-other-bytes test, and searching by size alone fails the
+two search-limit tests. Read-only against the photo SSD, the move logs resolved 98 earlier
+media rows that no longer sit at their recorded destination. 68 Oct 17 rows, written before the
+`630/` folder existed, have a same-name, same-size file at a new path that only the dump search
+reaches.
 
 ## Limits
 

@@ -202,7 +202,7 @@ def moved_to(path: str, moves: dict) -> str:
 
 
 def dump_media_by_size(dest: Path) -> dict:
-    """Files in the dump by size, for finding a copy that was moved or renamed without a log.
+    """Files in the dump by size, for finding a copy that was moved without a log.
     review/ and card-support/ hold reports and camera housekeeping, not media; hidden files and
     partial copies never count."""
     out = {}
@@ -217,17 +217,30 @@ def dump_media_by_size(dest: Path) -> dict:
     return out
 
 
+def keeps_camera_name(p: Path, src: Path) -> bool:
+    """A dump file named for this card file: the same name, or a renamed copy that ends with the
+    camera stem after a separator (2026-10-20_boys-first-wave-practice_short-defense-exchange__C3008.MP4)."""
+    if p.suffix.upper() != src.suffix.upper():
+        return False
+    stem, camera = p.stem, src.stem
+    return stem == camera or (stem.endswith(camera) and not stem[-len(camera) - 1].isalnum())
+
+
 def locate_copy(src: Path, size: int, candidates: list, moves: dict, by_size, source_hash: str | None = None):
     """An SSD file already holding this card file's bytes, as (path, how, source_hash).
 
-    Looks at each earlier destination and where the move logs took it, then at every dump file of
-    the same size (`by_size` is called only when needed). The source is hashed only when some
-    candidate has its size, so a new file is read once, by the copy. how is 'earlier-destination',
-    'move-log' or 'content-search'; path and how are None when no copy matches."""
+    Looks at each earlier destination and where the move logs took it, then at dump files of the
+    same size that keep the camera file name (`by_size` is called only when needed). Size alone is
+    not enough to search on: uncompressed Sony RAWs all share one size, so a new still would hash
+    every earlier one. A copy renamed without the camera name is not found and is copied again.
+    The source is hashed only when some candidate is left, so a new file is normally read once, by
+    the copy. how is 'earlier-destination', 'move-log' or 'dump-search'; path and how are None
+    when no copy matches."""
     seen, paths = set(), []
     for c in candidates:
         paths += [(Path(c), 'earlier-destination'), (Path(moved_to(c, moves)), 'move-log')]
-    for p, how in paths + [(p, 'content-search') for p in by_size().get(size, [])]:
+    named = [(p, 'dump-search') for p in by_size().get(size, []) if keeps_camera_name(p, src)]
+    for p, how in paths + named:
         if p in seen or not p.is_file() or p.stat().st_size != size:
             continue
         seen.add(p)

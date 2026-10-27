@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -99,13 +100,44 @@ class IngestAfterOrganize(unittest.TestCase):
             self.assertEqual(rows[name]['located_by'], 'move-log')
         self.assertEqual(self.video_files(c.dump), [f'{EVENT}/{n}' for n in sorted(c.clips)])
 
-    def test_a_move_without_a_log_is_found_by_content(self):
+    def test_a_move_without_a_log_is_found_by_its_camera_name(self):
         c = Card(self.tmp, log_moves=False)
+        renamed = c.dump / EVENT / '2026-11-01_test-event_serve__C0001.MP4'
+        (c.dump / EVENT / 'C0001.MP4').rename(renamed)
         rows = c.ingest(2)
         for name in c.clips:
             self.assertEqual(rows[name]['operation'], 'existing-content-verified', name)
-            self.assertEqual(rows[name]['located_by'], 'content-search')
-        self.assertEqual(self.video_files(c.dump), [f'{EVENT}/{n}' for n in sorted(c.clips)])
+            self.assertEqual(rows[name]['located_by'], 'dump-search')
+        self.assertEqual(rows['C0001.MP4']['destination'], str(renamed))
+        self.assertEqual(self.video_files(c.dump), sorted([f'{EVENT}/{renamed.name}', f'{EVENT}/C0001M01.XML', f'{EVENT}/C0002.MP4']))
+
+    def test_a_copy_renamed_without_the_camera_name_is_not_searched(self):
+        # The search is bounded to camera names; such a copy is copied again, as before the fix.
+        c = Card(self.tmp, log_moves=False)
+        (c.dump / EVENT / 'C0002.MP4').rename(c.dump / EVENT / 'serve.MP4')
+        rows = c.ingest(2)
+        self.assertEqual(rows['C0002.MP4']['operation'], 'copied-and-sha256-verified')
+        self.assertEqual(rows['C0002.MP4']['destination'], str(c.dump / 'video/C0002.MP4'))
+
+    def test_a_new_still_does_not_hash_unrelated_files_of_its_size(self):
+        # Uncompressed Sony RAWs share one size; a new still must not read every earlier one.
+        c = Card(self.tmp)
+        c.add_still()
+        others = c.dump / 'photo/earlier-event/raw'
+        others.mkdir(parents=True)
+        for n in range(20):
+            (others / f'DSC0{n + 5000}.ARW').write_bytes(b'Z' * len(b'raw still' * 1000))
+        hashed = []
+        real = sp.digest
+
+        def counting(path):
+            hashed.append(Path(path))
+            return real(path)
+
+        with mock.patch.object(sp, 'digest', counting):
+            rows = c.ingest(2)
+        self.assertEqual(rows['DSC00001.ARW']['operation'], 'copied-and-sha256-verified')
+        self.assertEqual([h for h in hashed if h.parent == others], [])
 
     def test_a_moved_copy_with_other_bytes_is_copied_again(self):
         c = Card(self.tmp)
